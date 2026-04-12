@@ -138,9 +138,19 @@ class Attention(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         B, N, C = x.shape
-        q = self.to_q(x).reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.to_k(x).reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.to_v(x).reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = self.to_q(x)
+        k = self.to_k(x)
+        v = self.to_v(x)
+
+        # Match PyTorch's interleaved QKV head assignment:
+        # cat Q,K,V -> view(1, N, heads, 3*hd) -> split per head
+        qkv = mx.concatenate([q, k, v], axis=-1)  # (B, N, 3*dim)
+        qkv = qkv.reshape(B, N, self.num_heads, 3 * self.head_dim)
+        q, k, v = mx.split(qkv, 3, axis=-1)  # each (B, N, heads, hd)
+
+        q = q.reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = k.reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = v.reshape(B, N, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         if self.q_norm is not None:
             q = self.q_norm(q)
@@ -193,9 +203,20 @@ class CrossAttention(nn.Module):
         B, S1, _ = x.shape
         _, S2, _ = y.shape
 
-        q = self.to_q(x).reshape(B, S1, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.to_k(y).reshape(B, S2, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.to_v(y).reshape(B, S2, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = self.to_q(x)
+        k = self.to_k(y)
+        v = self.to_v(y)
+
+        # Match PyTorch's interleaved KV head assignment:
+        # cat K,V -> view(B, S2, heads, 2*hd) -> split per head
+        kv = mx.concatenate([k, v], axis=-1)  # (B, S2, 2*qdim)
+        kv = kv.reshape(B, S2, self.num_heads, 2 * self.head_dim)
+        k, v = mx.split(kv, 2, axis=-1)  # each (B, S2, heads, hd)
+
+        # Q uses standard reshape (no interleaving)
+        q = q.reshape(B, S1, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = k.reshape(B, S2, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = v.reshape(B, S2, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         if self.q_norm is not None:
             q = self.q_norm(q)

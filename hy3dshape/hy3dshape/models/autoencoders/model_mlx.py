@@ -10,67 +10,7 @@ from typing import Optional, Callable
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-
-
-# --------------------------------------------------------------------------- #
-# FourierEmbedder (local implementation since mlx-ops doesn't have it)
-# --------------------------------------------------------------------------- #
-
-
-class FourierEmbedder(nn.Module):
-    """Fourier positional encoding for 3D coordinates.
-
-    Encodes each coordinate dimension into sin/cos frequency bands.
-
-    Args:
-        num_freqs: Number of frequency bands.
-        logspace: Use log-spaced frequencies.
-        input_dim: Input coordinate dimension (3 for XYZ).
-        include_input: Include raw input in output.
-        include_pi: Multiply frequencies by pi.
-    """
-
-    def __init__(
-        self,
-        num_freqs: int = 8,
-        logspace: bool = True,
-        input_dim: int = 3,
-        include_input: bool = True,
-        include_pi: bool = True,
-    ):
-        super().__init__()
-        if logspace:
-            frequencies = 2.0 ** mx.arange(num_freqs).astype(mx.float32)
-        else:
-            frequencies = mx.linspace(1.0, 2.0 ** (num_freqs - 1), num_freqs)
-
-        if include_pi:
-            frequencies = frequencies * math.pi
-
-        self.frequencies = frequencies
-        self.include_input = include_input
-        self.num_freqs = num_freqs
-        self.input_dim = input_dim
-
-        temp = 1 if include_input or num_freqs == 0 else 0
-        self.out_dim = input_dim * (num_freqs * 2 + temp)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        """
-        Args:
-            x: (..., input_dim) coordinate tensor.
-        Returns:
-            (..., out_dim) Fourier-encoded tensor.
-        """
-        if self.num_freqs > 0:
-            # x[..., None] * frequencies -> (..., input_dim, num_freqs)
-            embed = (x[..., None] * self.frequencies).reshape(*x.shape[:-1], -1)
-            if self.include_input:
-                return mx.concatenate([x, mx.sin(embed), mx.cos(embed)], axis=-1)
-            else:
-                return mx.concatenate([mx.sin(embed), mx.cos(embed)], axis=-1)
-        else:
-            return x
+from mlx_ops.encoding import FourierEmbedder
 
 
 # --------------------------------------------------------------------------- #

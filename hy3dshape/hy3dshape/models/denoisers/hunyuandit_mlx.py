@@ -645,9 +645,7 @@ class HunYuanDiTPlain(nn.Module):
             # Only quantize layers that have quantized weights in checkpoint
             # (recipe excludes embedders, norms, gate, final_layer)
             def _should_quantize(path, module):
-                return isinstance(module, nn.Linear) and any(
-                    path == qk.rsplit(".", 1)[0] for qk in quantized_keys
-                )
+                return isinstance(module, nn.Linear) and path in quantized_keys
 
             nn.quantize(model, group_size=group_size, bits=bits,
                         class_predicate=_should_quantize)

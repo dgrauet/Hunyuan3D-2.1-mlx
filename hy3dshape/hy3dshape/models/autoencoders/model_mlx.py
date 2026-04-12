@@ -412,7 +412,7 @@ class ShapeVAEDecoder(nn.Module):
         heads: int = 12,
         num_decoder_layers: int = 12,
         num_freqs: int = 8,
-        include_pi: bool = True,
+        include_pi: bool = False,
         qkv_bias: bool = False,
         qk_norm: bool = True,
         geo_decoder_downsample_ratio: int = 1,
@@ -503,6 +503,86 @@ class ShapeVAEDecoder(nn.Module):
         """
         return self.geo_decoder(queries=points, latents=features)
 
+    def _query_sdf_volume(
+        self,
+        xyz_samples: np.ndarray,
+        features: mx.array,
+        num_chunks: int = 10000,
+    ) -> np.ndarray:
+        """Query SDF values at a set of 3D points in chunks.
+
+        Args:
+            xyz_samples: (N, 3) query coordinates as numpy array.
+            features: (B, num_latents, width) decoded features.
+            num_chunks: Batch size for SDF queries.
+
+        Returns:
+            (N,) SDF values as float32 numpy array.
+        """
+        all_logits = []
+        total_points = xyz_samples.shape[0]
+        xyz_mx = mx.array(xyz_samples)
+        for start in range(0, total_points, num_chunks):
+            chunk = xyz_mx[start : start + num_chunks]
+            chunk = chunk[None, :, :]  # (1, chunk_size, 3)
+            chunk = chunk.astype(features.dtype)
+            logits = self.query_sdf(chunk, features)
+            _force_eval(logits)
+            all_logits.append(np.array(logits[0, :, 0]).astype(np.float32))
+        return np.concatenate(all_logits, axis=0)
+
+    def _extract_near_surface_mask(self, volume: np.ndarray, mc_level: float) -> np.ndarray:
+        """Find voxels near the iso-surface by checking sign changes with neighbors.
+
+        Matches the PyTorch ``extract_near_surface_volume_fn``.
+
+        Args:
+            volume: 3D SDF grid (D, D, D).
+            mc_level: Iso-level offset.
+
+        Returns:
+            Binary mask (D, D, D) of int32 where near-surface voxels are 1.
+        """
+        val = volume + mc_level
+        valid_mask = (val > -9000).astype(np.int32)
+
+        sign = np.sign(val.astype(np.float32))
+
+        # Check each of 6 neighbors for sign change
+        same_sign = np.ones(val.shape, dtype=bool)
+        for axis in range(3):
+            for shift in [1, -1]:
+                neighbor = np.roll(val, -shift, axis=axis).astype(np.float32)
+                # Replicate padding: overwrite the rolled boundary with the original
+                slc_src = [slice(None)] * 3
+                slc_dst = [slice(None)] * 3
+                if shift > 0:
+                    slc_src[axis] = slice(-1, None)
+                    slc_dst[axis] = slice(-1, None)
+                else:
+                    slc_src[axis] = slice(0, 1)
+                    slc_dst[axis] = slice(0, 1)
+                neighbor[tuple(slc_dst)] = val[tuple(slc_src)].astype(np.float32)
+                # Replace invalid neighbors with original value
+                invalid = neighbor <= -9000
+                neighbor[invalid] = val[invalid].astype(np.float32)
+                same_sign &= (np.sign(neighbor) == sign)
+
+        mask = (~same_sign).astype(np.int32)
+        return mask * valid_mask
+
+    def _dilate_3d(self, volume: np.ndarray) -> np.ndarray:
+        """3x3x3 dilation via scipy (matches PyTorch Conv3d with all-ones kernel).
+
+        Args:
+            volume: 3D array.
+
+        Returns:
+            Dilated 3D array.
+        """
+        from scipy.ndimage import maximum_filter
+        return maximum_filter(volume.astype(np.float64), size=3).astype(volume.dtype)
+
     def decode_to_mesh(
         self,
         latents: mx.array,
@@ -510,63 +590,120 @@ class ShapeVAEDecoder(nn.Module):
         octree_resolution: int = 256,
         num_chunks: int = 10000,
         mc_level: float = 0.0,
+        min_resolution: int = 63,
     ):
-        """Decode latents to a trimesh.Trimesh via marching cubes.
+        """Decode latents to a trimesh.Trimesh via hierarchical volume decoding.
+
+        Uses coarse-to-fine multi-resolution decoding (matching PyTorch
+        ``HierarchicalVolumeDecoding``) to find near-surface regions first,
+        then refines only those regions at higher resolutions. This avoids
+        grid-pattern noise that the vanilla single-resolution approach produces.
 
         Args:
             latents: (B, num_latents, embed_dim) latent vectors.
             bounds: Bounding box extent.
-            octree_resolution: Grid resolution for marching cubes.
+            octree_resolution: Final grid resolution for marching cubes.
             num_chunks: Batch size for SDF queries.
             mc_level: Marching cubes iso-level.
+            min_resolution: Minimum resolution for coarsest level.
 
         Returns:
             trimesh.Trimesh mesh object.
         """
         import trimesh
+        from skimage.measure import marching_cubes
 
         # Decode latents to features
         features = self.decode_latents(latents)
-        # Force materialization of features
         _force_eval(features)
 
-        # Generate dense grid
-        bbox_min = np.array([-bounds, -bounds, -bounds])
-        bbox_max = np.array([bounds, bounds, bounds])
+        # Compute bounding box
+        if isinstance(bounds, (int, float)):
+            bounds = float(bounds)
+            bbox_min = np.array([-bounds, -bounds, -bounds], dtype=np.float32)
+            bbox_max = np.array([bounds, bounds, bounds], dtype=np.float32)
+        bbox_size = bbox_max - bbox_min
+
+        # Build resolution pyramid (matching PyTorch HierarchicalVolumeDecoding)
+        resolutions = []
+        r = octree_resolution
+        if r < min_resolution:
+            resolutions.append(r)
+        while r >= min_resolution:
+            resolutions.append(r)
+            r = r // 2
+        resolutions.reverse()
+
+        # --- Coarsest level: query entire grid ---
+        coarse_res = resolutions[0]
         xyz_samples, grid_size, _ = generate_dense_grid_points(
-            bbox_min, bbox_max, octree_resolution, indexing="ij"
+            bbox_min, bbox_max, coarse_res, indexing="ij"
         )
-        xyz_samples = mx.array(xyz_samples.reshape(-1, 3))
+        xyz_flat = xyz_samples.reshape(-1, 3)
 
-        # Query SDF in chunks
-        all_logits = []
-        total_points = xyz_samples.shape[0]
-        for start in range(0, total_points, num_chunks):
-            chunk = xyz_samples[start : start + num_chunks]
-            chunk = chunk[None, :, :]  # (1, chunk_size, 3)
-            chunk = chunk.astype(features.dtype)
-            logits = self.query_sdf(chunk, features)
-            _force_eval(logits)
-            all_logits.append(np.array(logits))
+        print(f"Hierarchical Volume Decoding [r{coarse_res + 1}]: {xyz_flat.shape[0]} points")
+        sdf_vals = self._query_sdf_volume(xyz_flat, features, num_chunks)
+        grid_logits = sdf_vals.reshape(grid_size)
 
-        grid_logits = np.concatenate(all_logits, axis=1)
-        grid_logits = grid_logits.reshape(grid_size).astype(np.float32)
+        # --- Refine at each higher resolution ---
+        for level_idx, res_now in enumerate(resolutions[1:]):
+            grid_size_now = np.array([res_now + 1] * 3)
+            resolution_step = bbox_size / res_now
 
-        # Marching cubes (CPU)
-        try:
-            import mcubes
+            # Initialize next level with -10000 (unqueried sentinel)
+            next_logits = np.full(tuple(grid_size_now), -10000.0, dtype=np.float32)
 
-            vertices, faces = mcubes.marching_cubes(grid_logits, mc_level)
-        except ImportError:
-            from skimage.measure import marching_cubes
+            # Find near-surface voxels at current level
+            curr_mask = self._extract_near_surface_mask(grid_logits, mc_level)
+            # Also include voxels with small absolute SDF
+            curr_mask = curr_mask + (np.abs(grid_logits) < 0.95).astype(np.int32)
 
-            vertices, faces, _, _ = marching_cubes(grid_logits, level=mc_level)
+            # Dilation: expand for intermediate levels, not for final
+            if res_now == resolutions[-1]:
+                expand_num = 0
+            else:
+                expand_num = 1
 
-        # Scale vertices to bounding box
-        vertices = vertices / octree_resolution * (bbox_max - bbox_min) + bbox_min
+            for _ in range(expand_num):
+                curr_mask = self._dilate_3d(curr_mask)
 
-        # Flip face winding to match original
-        faces = faces[:, ::-1]
+            # Map coarse voxels to fine grid (2x upscale)
+            cidx = np.where(curr_mask > 0)
+            next_index = np.zeros(tuple(grid_size_now), dtype=np.float32)
+            # Clamp indices to stay within bounds of the next grid
+            fine_x = np.clip(cidx[0] * 2, 0, grid_size_now[0] - 1)
+            fine_y = np.clip(cidx[1] * 2, 0, grid_size_now[1] - 1)
+            fine_z = np.clip(cidx[2] * 2, 0, grid_size_now[2] - 1)
+            next_index[fine_x, fine_y, fine_z] = 1
+
+            # Dilate the seed points to cover neighborhood
+            for _ in range(2 - expand_num):
+                next_index = self._dilate_3d(next_index)
+
+            # Get coordinates of points to query
+            nidx = np.where(next_index > 0)
+            next_points = np.stack(nidx, axis=1).astype(np.float32)
+            next_points = next_points * resolution_step + bbox_min
+
+            print(f"Hierarchical Volume Decoding [r{res_now + 1}]: {next_points.shape[0]} points "
+                  f"(of {np.prod(grid_size_now)} total)")
+
+            sdf_vals = self._query_sdf_volume(next_points, features, num_chunks)
+            next_logits[nidx] = sdf_vals
+            grid_logits = next_logits
+
+        # Replace sentinel values with NaN (skimage marching_cubes handles NaN)
+        grid_logits[grid_logits == -10000.0] = float('nan')
+
+        # Marching cubes (matching original: skimage with lewiner method)
+        vertices, faces, _, _ = marching_cubes(
+            grid_logits, level=mc_level, method="lewiner"
+        )
+
+        # Scale vertices to bounding box coordinates
+        # grid_size = [R+1, R+1, R+1] matching the original _compute_box_stat
+        grid_size_arr = np.array([octree_resolution + 1] * 3, dtype=np.float32)
+        vertices = vertices / grid_size_arr * bbox_size + bbox_min
 
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
         return mesh

@@ -2,9 +2,18 @@
 
 MLX port of the HunYuanDiTPlain denoiser from hunyuandit.py.
 21 blocks with U-Net skip connections, last 6 blocks use MoE with shared expert.
+
+Weight key remapping (checkpoint -> module):
+  dit.t_embedder.mlp.0.*            -> t_embedder.mlp_0.*
+  dit.t_embedder.mlp.2.*            -> t_embedder.mlp_2.*
+  dit.blocks.N.moe.gate.weight      -> blocks.N.moe.gate.gate.weight  (raw param -> nn.Linear)
+  dit.blocks.N.moe.experts.E.net.0.proj.*  -> blocks.N.moe.experts.E.fc1.*
+  dit.blocks.N.moe.experts.E.net.2.*      -> blocks.N.moe.experts.E.fc2.*
+  dit.blocks.N.moe.shared_experts.*       -> blocks.N.moe.shared_expert.*
 """
 
 import math
+import re
 from typing import Optional
 
 import mlx.core as mx
@@ -50,6 +59,10 @@ class Timesteps(nn.Module):
 class TimestepEmbedder(nn.Module):
     """Embeds scalar timesteps into vector representations.
 
+    Checkpoint keys use ``t_embedder.mlp.0.weight/bias`` and
+    ``t_embedder.mlp.2.weight/bias`` (Sequential indices). The module uses
+    ``mlp_0``/``mlp_2`` and keys are remapped in ``from_pretrained``.
+
     Args:
         hidden_size: Input size for sinusoidal embedding.
         frequency_embedding_size: MLP hidden size.
@@ -92,6 +105,9 @@ class MLP(nn.Module):
 class Attention(nn.Module):
     """Multi-head self-attention with optional QK RMSNorm.
 
+    Note: Checkpoint has no bias on to_q/to_k/to_v but does have bias on
+    out_proj. The ``qkv_bias`` parameter only affects to_q/to_k/to_v.
+
     Args:
         dim: Hidden dimension.
         num_heads: Number of attention heads.
@@ -103,7 +119,7 @@ class Attention(nn.Module):
         self,
         dim: int,
         num_heads: int,
-        qkv_bias: bool = True,
+        qkv_bias: bool = False,
         qk_norm: bool = False,
     ):
         super().__init__()
@@ -139,6 +155,9 @@ class Attention(nn.Module):
 class CrossAttention(nn.Module):
     """Multi-head cross-attention (query attends to context).
 
+    Note: Checkpoint has no bias on to_q/to_k/to_v but does have bias on
+    out_proj.
+
     Args:
         qdim: Query dimension.
         kdim: Key/value dimension (context).
@@ -152,7 +171,7 @@ class CrossAttention(nn.Module):
         qdim: int,
         kdim: int,
         num_heads: int,
-        qkv_bias: bool = True,
+        qkv_bias: bool = False,
         qk_norm: bool = False,
     ):
         super().__init__()
@@ -287,8 +306,8 @@ class HunYuanDiTBlock(nn.Module):
         hidden_size: int,
         num_heads: int,
         context_dim: int = 1024,
-        qk_norm: bool = False,
-        qkv_bias: bool = True,
+        qk_norm: bool = True,
+        qkv_bias: bool = False,
         skip_connection: bool = False,
         timestep_modulate: bool = False,
         use_moe: bool = False,
@@ -296,11 +315,11 @@ class HunYuanDiTBlock(nn.Module):
         moe_top_k: int = 2,
     ):
         super().__init__()
-        # Self-attention
+        # Self-attention (no bias on Q/K/V, bias on out_proj)
         self.norm1 = nn.LayerNorm(hidden_size, eps=1e-6)
         self.attn1 = Attention(hidden_size, num_heads, qkv_bias=qkv_bias, qk_norm=qk_norm)
 
-        # Cross-attention
+        # Cross-attention (no bias on Q/K/V, bias on out_proj)
         self.norm2 = nn.LayerNorm(hidden_size, eps=1e-6)
         self.attn2 = CrossAttention(hidden_size, context_dim, num_heads, qkv_bias=qkv_bias, qk_norm=qk_norm)
 
@@ -403,11 +422,11 @@ class HunYuanDiTPlain(nn.Module):
         context_dim: int = 1024,
         depth: int = 24,
         num_heads: int = 16,
-        qk_norm: bool = False,
+        qk_norm: bool = True,
         text_len: int = 257,
         use_pos_emb: bool = False,
-        use_attention_pooling: bool = True,
-        qkv_bias: bool = True,
+        use_attention_pooling: bool = False,
+        qkv_bias: bool = False,
         num_moe_layers: int = 6,
         num_experts: int = 8,
         moe_top_k: int = 2,
@@ -523,6 +542,15 @@ class HunYuanDiTPlain(nn.Module):
     def from_pretrained(cls, weights_path: str, config: dict) -> "HunYuanDiTPlain":
         """Load from safetensors weights.
 
+        Handles key remapping from checkpoint format to MLX module format:
+        - Strips ``dit.`` prefix
+        - ``t_embedder.mlp.0`` -> ``t_embedder.mlp_0``
+        - ``t_embedder.mlp.2`` -> ``t_embedder.mlp_2``
+        - ``moe.gate.weight`` -> ``moe.gate.gate.weight`` (raw param to nn.Linear)
+        - ``moe.experts.E.net.0.proj`` -> ``moe.experts.E.fc1``
+        - ``moe.experts.E.net.2`` -> ``moe.experts.E.fc2``
+        - ``moe.shared_experts`` -> ``moe.shared_expert``
+
         Args:
             weights_path: Path to dit.safetensors.
             config: Dict with model config.
@@ -531,8 +559,57 @@ class HunYuanDiTPlain(nn.Module):
             Loaded HunYuanDiTPlain model.
         """
         model = cls(**config)
-        weights = mx.load(weights_path)
-        model.load_weights(list(weights.items()))
+        raw_weights = mx.load(weights_path)
+
+        remapped = {}
+        for key, value in raw_weights.items():
+            k = key
+            # Strip top-level prefix
+            if k.startswith("dit."):
+                k = k[len("dit."):]
+
+            # t_embedder MLP: Sequential index -> attribute name
+            k = k.replace("t_embedder.mlp.0.", "t_embedder.mlp_0.")
+            k = k.replace("t_embedder.mlp.2.", "t_embedder.mlp_2.")
+
+            # MoE gate: checkpoint stores raw param, module uses nn.Linear
+            # checkpoint: blocks.N.moe.gate.weight -> module: blocks.N.moe.gate.gate.weight
+            k = re.sub(
+                r"(blocks\.\d+\.moe)\.gate\.weight$",
+                r"\1.gate.gate.weight",
+                k,
+            )
+
+            # MoE experts: diffusers FeedForward naming -> simple MLP naming
+            # net.0.proj.weight/bias -> fc1.weight/bias
+            k = re.sub(
+                r"(blocks\.\d+\.moe\.experts\.\d+)\.net\.0\.proj\.",
+                r"\1.fc1.",
+                k,
+            )
+            # net.2.weight/bias -> fc2.weight/bias
+            k = re.sub(
+                r"(blocks\.\d+\.moe\.experts\.\d+)\.net\.2\.",
+                r"\1.fc2.",
+                k,
+            )
+
+            # MoE shared experts: shared_experts -> shared_expert (plural -> singular)
+            # Also apply the same net.0.proj / net.2 remapping
+            k = re.sub(
+                r"(blocks\.\d+\.moe)\.shared_experts\.net\.0\.proj\.",
+                r"\1.shared_expert.fc1.",
+                k,
+            )
+            k = re.sub(
+                r"(blocks\.\d+\.moe)\.shared_experts\.net\.2\.",
+                r"\1.shared_expert.fc2.",
+                k,
+            )
+
+            remapped[k] = value
+
+        model.load_weights(list(remapped.items()))
         # Force materialization of lazy parameters
         mx.eval(model.parameters())  # noqa: S307 - mx.eval triggers MLX lazy computation
         return model

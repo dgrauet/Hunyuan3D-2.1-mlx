@@ -18,10 +18,28 @@ from mlx_ops.encoding import FourierEmbedder
 # --------------------------------------------------------------------------- #
 
 
+class _QKNormGroup(nn.Module):
+    """Container for q_norm and k_norm to match checkpoint key hierarchy.
+
+    Checkpoint stores QK norms under ``attn.attention.q_norm`` /
+    ``attn.attention.k_norm``, so this module is stored as ``self.attention``
+    inside ``SelfAttention``.
+    """
+
+    def __init__(self, head_dim: int):
+        super().__init__()
+        self.q_norm = nn.LayerNorm(head_dim, eps=1e-6)
+        self.k_norm = nn.LayerNorm(head_dim, eps=1e-6)
+
+
 class SelfAttention(nn.Module):
     """Multi-head self-attention with fused QKV projection.
 
     Uses a single linear layer for Q, K, V (c_qkv: width -> 3*width).
+    Checkpoint has no bias on c_qkv.
+
+    QK norms are stored under ``self.attention`` sub-module to match
+    checkpoint key hierarchy (``attn.attention.q_norm``).
 
     Args:
         width: Hidden dimension.
@@ -34,8 +52,8 @@ class SelfAttention(nn.Module):
         self,
         width: int,
         heads: int,
-        qkv_bias: bool = True,
-        qk_norm: bool = False,
+        qkv_bias: bool = False,
+        qk_norm: bool = True,
     ):
         super().__init__()
         self.width = width
@@ -46,8 +64,8 @@ class SelfAttention(nn.Module):
         self.c_qkv = nn.Linear(width, width * 3, bias=qkv_bias)
         self.c_proj = nn.Linear(width, width)
 
-        self.q_norm = nn.LayerNorm(self.head_dim, eps=1e-6) if qk_norm else None
-        self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6) if qk_norm else None
+        # Store under ``attention`` to match checkpoint key ``attn.attention.q_norm``
+        self.attention = _QKNormGroup(self.head_dim) if qk_norm else None
 
     def __call__(self, x: mx.array) -> mx.array:
         B, N, C = x.shape
@@ -55,10 +73,9 @@ class SelfAttention(nn.Module):
         qkv = qkv.reshape(B, N, self.heads, 3 * self.head_dim)
         q, k, v = mx.split(qkv, 3, axis=-1)
 
-        if self.q_norm is not None:
-            q = self.q_norm(q)
-        if self.k_norm is not None:
-            k = self.k_norm(k)
+        if self.attention is not None:
+            q = self.attention.q_norm(q)
+            k = self.attention.k_norm(k)
 
         # (B, N, H, D) -> (B, H, N, D)
         q = q.transpose(0, 2, 1, 3)
@@ -101,8 +118,8 @@ class ResidualAttentionBlock(nn.Module):
         self,
         width: int,
         heads: int,
-        qkv_bias: bool = True,
-        qk_norm: bool = False,
+        qkv_bias: bool = False,
+        qk_norm: bool = True,
     ):
         super().__init__()
         self.ln_1 = nn.LayerNorm(width, eps=1e-6)
@@ -156,8 +173,41 @@ class Transformer(nn.Module):
 # --------------------------------------------------------------------------- #
 
 
+class _CrossAttnProjections(nn.Module):
+    """Container for cross-attention projections to match checkpoint hierarchy.
+
+    Checkpoint stores projections under ``cross_attn_decoder.attn.c_q``,
+    ``cross_attn_decoder.attn.c_kv``, ``cross_attn_decoder.attn.c_proj``,
+    and ``cross_attn_decoder.attn.attention.q_norm/k_norm``.
+
+    Args:
+        width: Query dimension.
+        data_width: Data (key/value) dimension.
+        heads: Number of attention heads.
+        qkv_bias: Whether to use bias on c_q and c_kv.
+        qk_norm: Whether to apply QK normalization.
+    """
+
+    def __init__(
+        self,
+        width: int,
+        data_width: int,
+        heads: int,
+        qkv_bias: bool = False,
+        qk_norm: bool = True,
+    ):
+        super().__init__()
+        self.c_q = nn.Linear(width, width, bias=qkv_bias)
+        self.c_kv = nn.Linear(data_width, width * 2, bias=qkv_bias)
+        self.c_proj = nn.Linear(width, width)
+        self.attention = _QKNormGroup(width // heads) if qk_norm else None
+
+
 class CrossAttentionBlock(nn.Module):
     """Cross-attention: queries attend to latent features.
+
+    Projections are grouped under ``self.attn`` to match checkpoint key
+    hierarchy (``cross_attn_decoder.attn.c_q``, etc.).
 
     Args:
         width: Hidden dimension for queries.
@@ -174,8 +224,8 @@ class CrossAttentionBlock(nn.Module):
         heads: int,
         data_width: int = None,
         mlp_expand_ratio: int = 4,
-        qkv_bias: bool = True,
-        qk_norm: bool = False,
+        qkv_bias: bool = False,
+        qk_norm: bool = True,
     ):
         super().__init__()
         data_width = data_width or width
@@ -183,15 +233,10 @@ class CrossAttentionBlock(nn.Module):
         self.heads = heads
         self.scale = self.head_dim ** -0.5
 
-        # Cross-attention
+        # Cross-attention projections grouped under ``attn`` for key matching
         self.ln_1 = nn.LayerNorm(width, eps=1e-6)
         self.ln_2 = nn.LayerNorm(data_width, eps=1e-6)
-        self.c_q = nn.Linear(width, width, bias=qkv_bias)
-        self.c_kv = nn.Linear(data_width, width * 2, bias=qkv_bias)
-        self.c_proj = nn.Linear(width, width)
-
-        self.q_norm = nn.LayerNorm(self.head_dim, eps=1e-6) if qk_norm else None
-        self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6) if qk_norm else None
+        self.attn = _CrossAttnProjections(width, data_width, heads, qkv_bias, qk_norm)
 
         # FFN
         self.ln_3 = nn.LayerNorm(width, eps=1e-6)
@@ -209,16 +254,15 @@ class CrossAttentionBlock(nn.Module):
         _, Nkv, _ = data.shape
 
         # Cross-attention
-        q = self.c_q(self.ln_1(x))
-        kv = self.c_kv(self.ln_2(data))
+        q = self.attn.c_q(self.ln_1(x))
+        kv = self.attn.c_kv(self.ln_2(data))
         kv = kv.reshape(B, Nkv, self.heads, 2 * self.head_dim)
         k, v = mx.split(kv, 2, axis=-1)
 
         q = q.reshape(B, Nq, self.heads, self.head_dim)
-        if self.q_norm is not None:
-            q = self.q_norm(q)
-        if self.k_norm is not None:
-            k = self.k_norm(k)
+        if self.attn.attention is not None:
+            q = self.attn.attention.q_norm(q)
+            k = self.attn.attention.k_norm(k)
 
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
@@ -226,7 +270,7 @@ class CrossAttentionBlock(nn.Module):
 
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
         out = out.transpose(0, 2, 1, 3).reshape(B, Nq, -1)
-        x = x + self.c_proj(out)
+        x = x + self.attn.c_proj(out)
 
         # FFN
         x = x + self.mlp(self.ln_3(x))
@@ -259,8 +303,8 @@ class CrossAttentionDecoder(nn.Module):
         mlp_expand_ratio: int = 4,
         downsample_ratio: int = 1,
         enable_ln_post: bool = True,
-        qkv_bias: bool = True,
-        qk_norm: bool = False,
+        qkv_bias: bool = False,
+        qk_norm: bool = True,
         label_type: str = "binary",
     ):
         super().__init__()
@@ -369,8 +413,8 @@ class ShapeVAEDecoder(nn.Module):
         num_decoder_layers: int = 12,
         num_freqs: int = 8,
         include_pi: bool = True,
-        qkv_bias: bool = True,
-        qk_norm: bool = False,
+        qkv_bias: bool = False,
+        qk_norm: bool = True,
         geo_decoder_downsample_ratio: int = 1,
         geo_decoder_mlp_expand_ratio: int = 4,
         geo_decoder_ln_post: bool = True,
@@ -391,6 +435,10 @@ class ShapeVAEDecoder(nn.Module):
         self.scale_factor = scale_factor
         self.latent_shape = (num_latents, embed_dim)
         self.width = width
+
+        # Encoder output projection (not used during decode, but weights
+        # exist in the checkpoint so we need a matching parameter slot)
+        self.pre_kl = nn.Linear(width, embed_dim * 2)
 
         # Latent to transformer space
         self.post_kl = nn.Linear(embed_dim, width)
@@ -527,6 +575,10 @@ class ShapeVAEDecoder(nn.Module):
     def from_pretrained(cls, weights_path: str, config: dict) -> "ShapeVAEDecoder":
         """Load from safetensors weights.
 
+        Handles key remapping:
+        - Strips ``vae.`` prefix
+        - Skips encoder weights (``encoder.*``) not needed for decoding
+
         Args:
             weights_path: Path to vae.safetensors.
             config: Dict with model config.
@@ -535,8 +587,23 @@ class ShapeVAEDecoder(nn.Module):
             Loaded ShapeVAEDecoder.
         """
         model = cls(**config)
-        weights = mx.load(weights_path)
-        model.load_weights(list(weights.items()))
+        raw_weights = mx.load(weights_path)
+
+        remapped = {}
+        for key, value in raw_weights.items():
+            k = key
+            # Strip top-level prefix
+            if k.startswith("vae."):
+                k = k[len("vae."):]
+
+            # Skip encoder weights (not needed for decode-only)
+            if k.startswith("encoder."):
+                continue
+
+            remapped[k] = value
+
+        # strict=False: fourier_embedder.frequencies is computed, not in checkpoint
+        model.load_weights(list(remapped.items()), strict=False)
         # Force materialization of lazy parameters
         _force_eval(model.parameters())
         return model

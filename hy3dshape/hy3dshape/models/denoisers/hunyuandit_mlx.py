@@ -630,7 +630,28 @@ class HunYuanDiTPlain(nn.Module):
 
             remapped[k] = value
 
-        # strict=False: quantized weights have extra .scales/.biases keys
+        # Detect quantization from weight keys (.scales/.biases present)
+        has_quantized = any(k.endswith(".scales") for k in remapped)
+        if has_quantized:
+            # Determine bits from weight packing ratio
+            # Quantized weight shape: (out, in // pack_factor)
+            # Find a quantized key to detect bits
+            for k, v in remapped.items():
+                if k.endswith(".scales"):
+                    base_key = k.replace(".scales", ".weight")
+                    if base_key in remapped:
+                        w = remapped[base_key]
+                        s = v
+                        # group_size = weight.shape[1] / scales.shape[1] * (32 / bits)
+                        # For int8: pack=4 (4 x int8 per uint32)
+                        # For int4: pack=8 (8 x int4 per uint32)
+                        group_size = (w.shape[-1] * 32) // (s.shape[-1] * 8)
+                        bits = 32 * w.shape[-1] // (s.shape[-1] * group_size)
+                        break
+            nn.quantize(model, group_size=group_size, bits=bits)
+
+        # strict=False: quantized weights have extra .scales/.biases keys,
+        # and computed buffers (fourier frequencies) may not be in checkpoint
         model.load_weights(list(remapped.items()), strict=False)
         # Force materialization of lazy parameters
         mx.eval(model.parameters())  # noqa: S307 - mx.eval triggers MLX lazy computation

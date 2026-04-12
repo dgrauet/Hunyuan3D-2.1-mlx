@@ -22,6 +22,49 @@
 [//]: # (  <a href="#"><img alt="PyPI - Downloads" src="https://img.shields.io/pypi/v/mulankit?logo=pypi"  height=22px></a>)
 <br>
 
+## Apple MLX Port (Apple Silicon)
+
+This fork adds native **MLX inference** for the shape generation stage (Stage 1: image to 3D mesh) on Apple Silicon Macs.
+
+### Quick Start
+
+```bash
+# Install dependencies
+pip install mlx mlx-ops safetensors Pillow trimesh scikit-image PyMCubes scipy
+
+# Convert weights (one-time, requires mlx-forge)
+pip install mlx-forge
+mlx-forge convert hunyuan3d-2.1 --output ./models/hunyuan3d-2.1-mlx
+
+# For INT8 quantized (smaller, fits 16GB Macs)
+mlx-forge convert hunyuan3d-2.1 --quantize --bits 8 --output ./models/hunyuan3d-2.1-mlx-q8
+```
+
+### Generate a 3D Mesh
+
+```python
+from hy3dshape.hy3dshape.pipeline_mlx import ShapePipeline
+
+pipe = ShapePipeline.from_pretrained("./models/hunyuan3d-2.1-mlx")
+mesh = pipe("your_image.png", num_inference_steps=50, guidance_scale=7.5, octree_resolution=256)
+mesh.export("output.glb")
+```
+
+### Memory Requirements
+
+| Precision | DiT Size | Peak Memory | Recommended Mac |
+|-----------|----------|-------------|-----------------|
+| FP16      | 5.7 GB   | ~10 GB      | 32 GB+          |
+| INT8      | 3.0 GB   | ~6 GB       | 16 GB+          |
+| INT4      | 1.6 GB   | ~4 GB       | 16 GB           |
+
+### Scope
+
+- Stage 1 (shape generation): fully ported to MLX
+- Stage 2 (PBR texture): not yet ported (uses original PyTorch code)
+
+---
+
 ## 🔥 News
 
 - Jul 26, 2025: 🤗 We release the first open-source, simulation-capable, immersive 3D world generation model, [HunyuanWorld-1.0](https://github.com/Tencent-Hunyuan/HunyuanWorld-1.0)!

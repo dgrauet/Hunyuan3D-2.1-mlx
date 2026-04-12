@@ -214,10 +214,20 @@ class ShapePipeline:
             config.get("image_encoder", {}),
         )
 
-        # Load DiT
+        # Load DiT (pass quantization params if present)
+        dit_config = dict(config.get("dit", {}))
+        split_path = model_dir / "split_model.json"
+        if split_path.exists():
+            with open(split_path) as f:
+                split_info = json.load(f)
+            quant_info = split_info.get("quantization", {})
+            if "dit" in quant_info.get("quantized_components", []):
+                dit_config["bits"] = quant_info.get("bits", 8)
+                dit_config["group_size"] = quant_info.get("group_size", 64)
+
         dit = HunYuanDiTPlain.from_pretrained(
             str(model_dir / "dit.safetensors"),
-            config.get("dit", {}),
+            dit_config,
         )
 
         # Load VAE

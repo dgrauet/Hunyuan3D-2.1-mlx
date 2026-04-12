@@ -633,21 +633,13 @@ class HunYuanDiTPlain(nn.Module):
         # Detect quantization from weight keys (.scales/.biases present)
         quantized_keys = {k.rsplit(".scales", 1)[0] for k in remapped if k.endswith(".scales")}
         if quantized_keys:
-            # Determine bits and group_size from a quantized weight
-            for qk in quantized_keys:
-                w = remapped.get(qk + ".weight")
-                s = remapped.get(qk + ".scales")
-                if w is not None and s is not None:
-                    group_size = (w.shape[-1] * 32) // (s.shape[-1] * 8)
-                    bits = 32 * w.shape[-1] // (s.shape[-1] * group_size)
-                    break
-
             # Only quantize layers that have quantized weights in checkpoint
-            # (recipe excludes embedders, norms, gate, final_layer)
             def _should_quantize(path, module):
                 return isinstance(module, nn.Linear) and path in quantized_keys
 
-            nn.quantize(model, group_size=group_size, bits=bits,
+            nn.quantize(model,
+                        group_size=config.get("group_size", 64),
+                        bits=config.get("bits", 8),
                         class_predicate=_should_quantize)
 
         # strict=False: quantized weights have extra .scales/.biases keys,

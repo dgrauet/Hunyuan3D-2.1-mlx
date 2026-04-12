@@ -631,24 +631,26 @@ class HunYuanDiTPlain(nn.Module):
             remapped[k] = value
 
         # Detect quantization from weight keys (.scales/.biases present)
-        has_quantized = any(k.endswith(".scales") for k in remapped)
-        if has_quantized:
-            # Determine bits from weight packing ratio
-            # Quantized weight shape: (out, in // pack_factor)
-            # Find a quantized key to detect bits
-            for k, v in remapped.items():
-                if k.endswith(".scales"):
-                    base_key = k.replace(".scales", ".weight")
-                    if base_key in remapped:
-                        w = remapped[base_key]
-                        s = v
-                        # group_size = weight.shape[1] / scales.shape[1] * (32 / bits)
-                        # For int8: pack=4 (4 x int8 per uint32)
-                        # For int4: pack=8 (8 x int4 per uint32)
-                        group_size = (w.shape[-1] * 32) // (s.shape[-1] * 8)
-                        bits = 32 * w.shape[-1] // (s.shape[-1] * group_size)
-                        break
-            nn.quantize(model, group_size=group_size, bits=bits)
+        quantized_keys = {k.rsplit(".scales", 1)[0] for k in remapped if k.endswith(".scales")}
+        if quantized_keys:
+            # Determine bits and group_size from a quantized weight
+            for qk in quantized_keys:
+                w = remapped.get(qk + ".weight")
+                s = remapped.get(qk + ".scales")
+                if w is not None and s is not None:
+                    group_size = (w.shape[-1] * 32) // (s.shape[-1] * 8)
+                    bits = 32 * w.shape[-1] // (s.shape[-1] * group_size)
+                    break
+
+            # Only quantize layers that have quantized weights in checkpoint
+            # (recipe excludes embedders, norms, gate, final_layer)
+            def _should_quantize(path, module):
+                return isinstance(module, nn.Linear) and any(
+                    path == qk.rsplit(".", 1)[0] for qk in quantized_keys
+                )
+
+            nn.quantize(model, group_size=group_size, bits=bits,
+                        class_predicate=_should_quantize)
 
         # strict=False: quantized weights have extra .scales/.biases keys,
         # and computed buffers (fourier frequencies) may not be in checkpoint

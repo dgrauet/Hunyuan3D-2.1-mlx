@@ -131,8 +131,9 @@ class ShapePipeline:
         latents = mx.random.normal((1, num_latents, latent_dim))
         _materialize(latents)
 
-        # 4. Set up scheduler (let it compute sigmas from sigma_max to sigma_min)
-        self.scheduler.set_timesteps(num_inference_steps)
+        # 4. Set up scheduler with sigmas from 0 to 1 (matching original pipeline)
+        sigmas = np.linspace(0, 1, num_inference_steps)
+        self.scheduler.set_timesteps(num_inference_steps, sigmas=sigmas)
 
         do_cfg = guidance_scale >= 0
 
@@ -149,6 +150,9 @@ class ShapePipeline:
                 latent_input = latents
                 context = cond
                 t_batch = mx.broadcast_to(t, (1,))
+
+            # Normalize timesteps to [0, 1] range (matching original flow matching pipeline)
+            t_batch = t_batch / self.scheduler.num_train_timesteps
 
             # Model prediction
             noise_pred = self.dit(

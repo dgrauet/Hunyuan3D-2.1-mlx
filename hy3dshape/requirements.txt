@@ -38,3 +38,9 @@ rembg
 onnxruntime
 #gevent
 #geventhttpclient
+
+# MLX port
+mlx>=0.31.0
+mlx-ops
+safetensors
+Pillow

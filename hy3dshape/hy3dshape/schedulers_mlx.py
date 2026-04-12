@@ -29,27 +29,31 @@ class FlowMatchEulerDiscreteScheduler:
     def set_timesteps(self, num_inference_steps: int, sigmas=None):
         """Set the discrete timesteps for inference.
 
+        Matches the original PyTorch scheduler: ascending sigmas from ~0 to ~1,
+        with a terminal sigma=1.0 appended for the last Euler step.
+
         Args:
             num_inference_steps: Number of denoising steps.
             sigmas: Optional custom sigma schedule (numpy array).
         """
         if sigmas is None:
-            # sigma_max = shift * 1 / (1 + (shift-1)*1) = 1.0 for shift=1
-            # sigma_min = shift * (1/N) / (1 + (shift-1)*(1/N))
-            sigma_max = self.shift * 1.0 / (1.0 + (self.shift - 1.0) * 1.0)
-            sigma_min = self.shift * (1.0 / self.num_train_timesteps) / (
-                1.0 + (self.shift - 1.0) * (1.0 / self.num_train_timesteps)
+            # Original logic: linspace from sigma_max to sigma_min where
+            # sigma_max = sigmas[0] ≈ 0.001 (near clean) and
+            # sigma_min = sigmas[-1] = 1.0 (full noise) — confusing names!
+            # Result: ASCENDING sigmas from ~0.001 to ~1.0
+            timesteps = np.linspace(
+                1, self.num_train_timesteps, num_inference_steps, dtype=np.float32
             )
-            sigmas = np.linspace(sigma_max, sigma_min, num_inference_steps)
+            sigmas = timesteps / self.num_train_timesteps
+            sigmas = self.shift * sigmas / (1.0 + (self.shift - 1.0) * sigmas)
         else:
             sigmas = np.asarray(sigmas, dtype=np.float32)
-            # Apply shift
             sigmas = self.shift * sigmas / (1.0 + (self.shift - 1.0) * sigmas)
 
         timesteps = sigmas * self.num_train_timesteps
 
         self.timesteps = mx.array(timesteps, dtype=mx.float32)
-        # Append terminal sigma=1.0 at the end
+        # Append terminal sigma=1.0 (matches original torch.cat([sigmas, ones(1)]))
         self.sigmas = mx.array(
             np.concatenate([sigmas, np.ones(1, dtype=np.float32)]), dtype=mx.float32
         )

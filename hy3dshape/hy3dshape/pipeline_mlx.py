@@ -131,27 +131,24 @@ class ShapePipeline:
         latents = mx.random.normal((1, num_latents, latent_dim))
         _materialize(latents)
 
-        # 4. Set up scheduler
-        sigmas = np.linspace(0, 1, num_inference_steps).astype(np.float32)
-        self.scheduler.set_timesteps(num_inference_steps, sigmas=sigmas)
+        # 4. Set up scheduler (let it compute sigmas from sigma_max to sigma_min)
+        self.scheduler.set_timesteps(num_inference_steps)
 
         do_cfg = guidance_scale >= 0
 
         # 5. Denoising loop
         for i in range(num_inference_steps):
             t = self.scheduler.timesteps[i]
-            # Normalized timestep (0 to 1)
-            t_normalized = t / self.scheduler.num_train_timesteps
 
             if do_cfg:
                 # Duplicate latents for CFG
                 latent_input = mx.concatenate([latents, latents], axis=0)
                 context = mx.concatenate([cond, uncond], axis=0)
-                t_batch = mx.broadcast_to(t_normalized, (2,))
+                t_batch = mx.broadcast_to(t, (2,))
             else:
                 latent_input = latents
                 context = cond
-                t_batch = mx.broadcast_to(t_normalized, (1,))
+                t_batch = mx.broadcast_to(t, (1,))
 
             # Model prediction
             noise_pred = self.dit(

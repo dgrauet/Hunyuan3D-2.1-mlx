@@ -630,7 +630,8 @@ class HunYuanDiTPlain(nn.Module):
 
             remapped[k] = value
 
-        model.load_weights(list(remapped.items()))
+        # strict=False: quantized weights have extra .scales/.biases keys
+        model.load_weights(list(remapped.items()), strict=False)
         # Force materialization of lazy parameters
         mx.eval(model.parameters())  # noqa: S307 - mx.eval triggers MLX lazy computation
         return model

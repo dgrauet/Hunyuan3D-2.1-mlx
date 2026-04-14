@@ -19,12 +19,19 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-MESH_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "assets", "case_2", "mesh.glb"
+CASE_DIR = os.path.join(
+    os.path.dirname(__file__), "..", "assets", "case_2"
 )
-REF_IMAGE_PATH = "/tmp/full/ComfyUI_temp_cpzbr_00007_.png"
+MESH_PATH = os.path.join(CASE_DIR, "mesh.glb")
+# IMPORTANT: the reference image must match the mesh content. case_2 is a
+# mermaid, so we use assets/case_2/image.png. Passing a mismatched reference
+# (e.g. an astronaut on a mermaid mesh) asks the diffusion to map incompatible
+# geometry — the multiview views may look plausible individually but
+# back-projecting them onto the UV atlas of an unrelated mesh yields fragmented
+# noise.
+REF_IMAGE_PATH = os.path.join(CASE_DIR, "image.png")
 OUT_DIR = "/tmp/full/e2e_mesh"
-OUTPUT_OBJ = os.path.join(OUT_DIR, "textured_astronaut.obj")
+OUTPUT_OBJ = os.path.join(OUT_DIR, "textured_mermaid.obj")
 
 
 def main() -> None:

@@ -892,13 +892,23 @@ class MeshRenderMLX:
 
         return self.fast_bake_texture(textures, cos_maps)
 
-    def uv_inpaint(self, texture, mask, method="NS"):
+    def uv_inpaint(self, texture, mask, method="NS", vertex_inpaint=True):
         """Inpaint missing regions in UV texture.
+
+        The PyTorch pipeline does this in two passes:
+          1. Mesh-aware vertex-color propagation (fills most of the gaps
+             between UV islands using the underlying 3D adjacency).
+          2. cv2.inpaint for the remaining small gaps.
+
+        Skipping step 1 makes step 2 hallucinate across massive UV-island
+        boundaries and produces noisy, fragmented output on any non-trivial
+        mesh — exactly what we were seeing on the mermaid test.
 
         Args:
             texture: (H, W, C) numpy array in [0, 1].
             mask: (H, W) or (H, W, 1) numpy uint8, 255=keep, 0=inpaint.
             method: "NS" for Navier-Stokes (cv2.INPAINT_NS).
+            vertex_inpaint: Run the mesh-aware propagation pass first.
 
         Returns:
             (H, W, C) numpy uint8 array.
@@ -913,6 +923,18 @@ class MeshRenderMLX:
         if mask.dtype != np.uint8:
             mask = (mask * 255).astype(np.uint8)
 
-        texture_u8 = (np.clip(texture, 0, 1) * 255).astype(np.uint8)
+        tex_f = np.clip(texture, 0, 1).astype(np.float32)
+
+        if vertex_inpaint and self.vtx_uv is not None and self.uv_idx is not None:
+            from .mesh_inpaint_py import mesh_vertex_inpaint
+            vtx_pos_np = np.asarray(self.vtx_pos)
+            vtx_uv_np = np.asarray(self.vtx_uv)
+            pos_idx_np = np.asarray(self.pos_idx)
+            uv_idx_np = np.asarray(self.uv_idx)
+            tex_f, mask = mesh_vertex_inpaint(
+                tex_f, mask, vtx_pos_np, vtx_uv_np, pos_idx_np, uv_idx_np,
+            )
+
+        texture_u8 = (np.clip(tex_f, 0, 1) * 255).astype(np.uint8)
         result = cv2.inpaint(texture_u8, 255 - mask, 3, cv2.INPAINT_NS)
         return result

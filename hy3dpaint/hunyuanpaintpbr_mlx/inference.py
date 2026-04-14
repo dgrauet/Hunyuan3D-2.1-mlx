@@ -15,7 +15,7 @@ import numpy as np
 from PIL import Image
 
 from .dino_mlx import preprocess_for_dino
-from .load_model import HunyuanPaintModelMLX
+from .load_model import HunyuanPaintModelMLX, extract_reference_features
 
 
 def _cam_mapping(azim: float) -> float:
@@ -104,7 +104,10 @@ def generate_multiview_pbr(
     mx.synchronize()
 
     # ------------------------------------------------------------------
-    # 2b. Reference features (disabled — monkey-patch causes hang on M2)
+    # 2b. Reference features — DISABLED
+    # The capture point differs from PyTorch (post-residual vs post-norm1)
+    # which produces incorrect features that blocks denoising convergence.
+    # TODO: fix capture point to match PyTorch norm_hidden_states
     # ------------------------------------------------------------------
     ref_features = None
 
@@ -165,15 +168,18 @@ def generate_multiview_pbr(
 
         # Process views in chunks to fit in memory
         # Each chunk: a few views × n_pbr samples, 3 CFG passes
-        chunk_size = max(1, min(n_views, 2))  # 2 views at a time
+        chunk_size = 1  # 1 view at a time (64 heads × 4096 tokens needs ~4GB per sample)
         t_arr = mx.array([t_int])
-        noise_parts = []
+        noise_guided = mx.zeros_like(latents)
 
         for v_start in range(0, n_views, chunk_size):
             v_end = min(v_start + chunk_size, n_views)
             n_chunk = v_end - v_start
 
             # Gather chunk indices for both materials
+            # Order: [albedo_v_start..v_end, mr_v_start..v_end]
+            # Maps into full latent array ordered as
+            # [albedo_0..N-1, mr_0..N-1]
             chunk_idx = list(range(v_start, v_end)) + [
                 n_views + j for j in range(v_start, v_end)
             ]
@@ -214,9 +220,11 @@ def generate_multiview_pbr(
                 + guidance_scale * vs * (pred_ref - pred_uncond)
                 + guidance_scale * vs * (pred_full - pred_ref)
             )
-            noise_parts.append(guided)
 
-        noise_guided = mx.concatenate(noise_parts, axis=0)  # (12, h, w, 4)
+            # Scatter chunk results back to correct positions in the
+            # full latent array.  chunk_idx maps each chunk sample to
+            # its position in the [albedo_0..N-1, mr_0..N-1] layout.
+            noise_guided[mx.array(chunk_idx)] = guided
 
         # Scheduler step
         latents = model.scheduler.step(noise_guided, t_int, latents)

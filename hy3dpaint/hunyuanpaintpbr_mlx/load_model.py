@@ -57,8 +57,9 @@ def _enhance_transformer_block(block, dim: int, cross_attention_dim: int):
     - block.attn_multiview -> Attention (self-attn with RoPE)
     - block.attn_refview -> Attention + processor
     """
-    head_dim = dim // 8 if dim >= 64 else dim
-    heads = dim // head_dim
+    # Get head config from the block's existing attn1 (set by UNet with correct head_dims)
+    heads = block.attn1.heads
+    head_dim = block.attn1.dim_head
 
     # MDA processor on attn1
     block.attn1.processor = MDAProcessor(dim)
@@ -88,29 +89,42 @@ def _enhance_transformer_block(block, dim: int, cross_attention_dim: int):
 
 
 def _enhance_unet(unet: UNet2DConditionModelMLX, cross_attention_dim: int = 1024):
-    """Add 2.5D modules to all transformer blocks in a UNet."""
+    """Add 2.5D modules to all transformer blocks in a UNet.
+
+    Also assigns a unique ``_block_id`` (str) to each transformer block so
+    that the capture-based reference feature extraction can key features
+    without monkey-patching ``__call__``.
+    """
+    counter = 0
+
     # Down blocks
-    for block in unet.down_blocks:
+    for bi, block in enumerate(unet.down_blocks):
         if hasattr(block, "attentions"):
-            for attn_block in block.attentions:
+            for ai, attn_block in enumerate(block.attentions):
                 dim = attn_block.in_channels
-                for tb in attn_block.transformer_blocks:
+                for ti, tb in enumerate(attn_block.transformer_blocks):
                     _enhance_transformer_block(tb, dim, cross_attention_dim)
+                    tb._block_id = str(counter)
+                    counter += 1
 
     # Mid block
     if hasattr(unet.mid_block, "attentions"):
-        for attn_block in unet.mid_block.attentions:
+        for ai, attn_block in enumerate(unet.mid_block.attentions):
             dim = attn_block.in_channels
-            for tb in attn_block.transformer_blocks:
+            for ti, tb in enumerate(attn_block.transformer_blocks):
                 _enhance_transformer_block(tb, dim, cross_attention_dim)
+                tb._block_id = str(counter)
+                counter += 1
 
     # Up blocks
-    for block in unet.up_blocks:
+    for bi, block in enumerate(unet.up_blocks):
         if hasattr(block, "attentions"):
-            for attn_block in block.attentions:
+            for ai, attn_block in enumerate(block.attentions):
                 dim = attn_block.in_channels
-                for tb in attn_block.transformer_blocks:
+                for ti, tb in enumerate(attn_block.transformer_blocks):
                     _enhance_transformer_block(tb, dim, cross_attention_dim)
+                    tb._block_id = str(counter)
+                    counter += 1
 
 
 # ---------------------------------------------------------------------------
@@ -130,14 +144,22 @@ def extract_reference_features(
     and the intermediate features at each transformer block are cached.
     These are then used as key/value context by attn_refview in the main pass.
 
+    Instead of monkey-patching ``__call__`` (which hangs on Apple Silicon),
+    this passes a ``_capture_dict`` through kwargs.  Each
+    ``BasicTransformerBlock`` that has a ``_block_id`` attribute will store
+    its post-self-attention hidden states into this dict during the forward
+    pass.
+
     Args:
         unet: The UNet (main or dual) to extract features from.
+              Transformer blocks must have ``_block_id`` set (done by
+              ``_enhance_unet``).
         ref_latent: (1, H, W, 4) reference image latent.
         ref_text: (1, 77, C) text embeddings for reference.
         condition_latents: (1, H, W, 8) optional normal+position latent concat.
 
     Returns:
-        Dict mapping block index (str) to (1, L, C) feature tensors.
+        Dict mapping block id (str) to (1, L, C) feature tensors.
     """
     # Prepare input
     if condition_latents is not None:
@@ -147,59 +169,16 @@ def extract_reference_features(
         pad = mx.zeros((*ref_latent.shape[:-1], 8))
         unet_input = mx.concatenate([ref_latent, pad], axis=-1)
 
-    # Collect features from each transformer block during forward
-    features = {}
-    block_idx = [0]
+    # Dict that BasicTransformerBlock will populate during the forward pass
+    capture_dict: dict = {}
 
-    def _collect_features(block, hidden_states, encoder_hidden_states, temb, **kw):
-        """Wrapper that captures output and stores it."""
-        result = _original_calls[id(block)](hidden_states, encoder_hidden_states, temb, **kw)
-        features[str(block_idx[0])] = result
-        block_idx[0] += 1
-        return result
-
-    # Monkey-patch transformer block __call__ temporarily
-    _original_calls = {}
-    all_blocks = []
-
-    for down_block in unet.down_blocks:
-        if hasattr(down_block, "attentions"):
-            for attn in down_block.attentions:
-                for tb in attn.transformer_blocks:
-                    _original_calls[id(tb)] = tb.__call__
-                    all_blocks.append(tb)
-
-    if hasattr(unet.mid_block, "attentions"):
-        for attn in unet.mid_block.attentions:
-            for tb in attn.transformer_blocks:
-                _original_calls[id(tb)] = tb.__call__
-                all_blocks.append(tb)
-
-    for up_block in unet.up_blocks:
-        if hasattr(up_block, "attentions"):
-            for attn in up_block.attentions:
-                for tb in attn.transformer_blocks:
-                    _original_calls[id(tb)] = tb.__call__
-                    all_blocks.append(tb)
-
-    # Patch
-    for tb in all_blocks:
-        orig = _original_calls[id(tb)]
-        tb.__call__ = lambda hs, enc=None, t=None, _orig=orig, **kw: (
-            features.update({str(block_idx[0]): _orig(hs, enc, t, **kw)}),
-            block_idx.__setitem__(0, block_idx[0] + 1),
-            features[str(block_idx[0] - 1)],
-        )[-1]
-
-    # Forward pass at timestep 0 (frozen reference)
-    _ = unet(unet_input, mx.array([0]), ref_text)
+    # Forward pass at timestep 0 (frozen reference).
+    # The _capture_dict kwarg is propagated through UNet -> blocks -> transformer
+    # blocks via **kwargs.
+    _ = unet(unet_input, mx.array([0]), ref_text, _capture_dict=capture_dict)
     mx.synchronize()
 
-    # Restore
-    for tb in all_blocks:
-        tb.__call__ = _original_calls[id(tb)]
-
-    return features
+    return capture_dict
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +240,7 @@ class HunyuanPaintModelMLX:
             in_channels=12, out_channels=4,
             block_out_channels=(320, 640, 1280, 1280),
             cross_attention_dim=1024,
-            attention_head_dim=8,
+            attention_head_dim=(5, 10, 20, 20),
         )
         # Add 2.5D modules to match checkpoint structure
         _enhance_unet(unet, cross_attention_dim=1024)

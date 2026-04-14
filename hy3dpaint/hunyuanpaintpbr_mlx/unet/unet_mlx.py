@@ -40,13 +40,18 @@ class UNet2DConditionModelMLX(nn.Module):
         out_channels: int = 4,
         block_out_channels: tuple = (320, 640, 1280, 1280),
         cross_attention_dim: int = 1024,
-        attention_head_dim: int = 8,
+        attention_head_dim: tuple | int = (5, 10, 20, 20),
         layers_per_block: int = 2,
         transformer_layers_per_block: int = 1,
     ):
         super().__init__()
         self.in_channels = in_channels
         time_embed_dim = block_out_channels[0] * 4  # 1280
+
+        # Normalize attention_head_dim to a list
+        if isinstance(attention_head_dim, int):
+            attention_head_dim = [attention_head_dim] * len(block_out_channels)
+        self._attention_head_dims = list(attention_head_dim)
 
         # Timestep embedding
         self.time_proj_dim = block_out_channels[0]  # 320
@@ -66,10 +71,8 @@ class UNet2DConditionModelMLX(nn.Module):
             output_channel = ch
 
             if i < len(block_out_channels) - 1:
-                # CrossAttn blocks for first 3 levels
-                num_heads = ch // (ch // attention_head_dim) if attention_head_dim < ch else 1
-                # SD 2.1 uses attention_head_dim as the per-head dimension
-                num_heads = ch // attention_head_dim
+                head_dim = self._attention_head_dims[i]
+                num_heads = ch // head_dim
                 self.down_blocks.append(
                     CrossAttnDownBlock2D(
                         in_channels=input_channel,
@@ -96,7 +99,7 @@ class UNet2DConditionModelMLX(nn.Module):
 
         # Mid block
         mid_channels = block_out_channels[-1]
-        num_mid_heads = mid_channels // attention_head_dim
+        num_mid_heads = mid_channels // self._attention_head_dims[-1]
         self.mid_block = UNetMidBlock2DCrossAttn(
             in_channels=mid_channels,
             temb_channels=time_embed_dim,
@@ -116,8 +119,10 @@ class UNet2DConditionModelMLX(nn.Module):
             input_channel = reversed_channels[min(i + 1, len(reversed_channels) - 1)]
 
             if i > 0:
-                # CrossAttn for last 3 levels
-                num_heads = ch // attention_head_dim
+                # CrossAttn — use reversed head_dim to match down blocks
+                rev_idx = len(block_out_channels) - 1 - i
+                head_dim = self._attention_head_dims[max(rev_idx, 0)]
+                num_heads = ch // head_dim
                 self.up_blocks.append(
                     CrossAttnUpBlock2D(
                         in_channels=input_channel,
@@ -178,10 +183,6 @@ class UNet2DConditionModelMLX(nn.Module):
         # Broadcast for batch
         if emb.shape[0] == 1 and sample.shape[0] > 1:
             emb = mx.broadcast_to(emb, (sample.shape[0],) + emb.shape[1:])
-
-        # Reset ref feature counter for each forward pass
-        if "ref_features" in kwargs:
-            kwargs["_ref_counter"] = [0]
 
         # Input conv
         sample = self.conv_in(sample)

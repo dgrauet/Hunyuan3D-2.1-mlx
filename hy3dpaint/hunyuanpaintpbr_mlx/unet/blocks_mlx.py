@@ -229,6 +229,9 @@ class BasicTransformerBlock(nn.Module):
         n_pbr = kwargs.get("n_pbr", 2)
         has_25d = hasattr(self, "attn_multiview")
 
+        # --- Capture mode: store post-self-attn features for reference ---
+        _capture_dict = kwargs.get("_capture_dict")
+
         # --- Step 1: Self-attention (with MDA if available) ---
         norm_hs = self.norm1(hidden_states)
 
@@ -270,15 +273,21 @@ class BasicTransformerBlock(nn.Module):
 
         hidden_states = attn_out + hidden_states
 
+        # If in capture mode, store post-self-attn hidden states and return
+        # early (reference extraction only needs features up to this point).
+        if _capture_dict is not None:
+            block_id = getattr(self, "_block_id", "unknown")
+            _capture_dict[block_id] = hidden_states
+            # Still run remaining layers so the forward pass produces valid
+            # output for downstream blocks, but we already captured what we need.
+
         # --- Step 2: Reference attention (if features provided) ---
         ref_features = kwargs.get("ref_features")
         if has_25d and hasattr(self, "attn_refview") and ref_features is not None:
-            # ref_features is a dict keyed by block index (str).
-            # Use _ref_block_counter to know which entry to use.
-            ref_counter = kwargs.get("_ref_counter", [0])
-            ref_key = str(ref_counter[0])
-            if ref_key in ref_features:
-                ref_ctx = ref_features[ref_key]  # (1, L_ref, C)
+            # ref_features is a dict keyed by _block_id (str).
+            block_id = getattr(self, "_block_id", None)
+            if block_id is not None and block_id in ref_features:
+                ref_ctx = ref_features[block_id]  # (1, L_ref, C)
                 # Broadcast ref context to batch size
                 if ref_ctx.shape[0] < hidden_states.shape[0]:
                     ref_ctx = mx.broadcast_to(
@@ -287,7 +296,6 @@ class BasicTransformerBlock(nn.Module):
                 norm_hs = self.norm1(hidden_states)
                 ref_attn = self.attn_refview(norm_hs, ref_ctx)
                 hidden_states = ref_attn + hidden_states
-            ref_counter[0] += 1
 
         # --- Step 3: Multiview attention ---
         if has_25d and n_views > 1:

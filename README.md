@@ -24,31 +24,58 @@
 
 ## Apple MLX Port (Apple Silicon)
 
-This fork adds native **MLX inference** for the shape generation stage (Stage 1: image to 3D mesh) on Apple Silicon Macs.
+This fork adds native **MLX inference** for the full Hunyuan3D-2.1 pipeline on Apple Silicon Macs — both shape generation (image → mesh) and PBR texture synthesis (mesh + reference image → textured GLB).
 
-### Quick Start
+### Weights
+
+Pre-converted MLX weights are hosted on HuggingFace and auto-downloaded on first use:
+
+> [`dgrauet/hunyuan3d-2.1-mlx`](https://huggingface.co/dgrauet/hunyuan3d-2.1-mlx)
+
+If you'd rather convert from the original PyTorch checkpoints yourself:
 
 ```bash
-# Install dependencies
-pip install mlx mlx-ops safetensors Pillow trimesh scikit-image PyMCubes scipy
-
-# Convert weights (one-time, requires mlx-forge)
 pip install mlx-forge
 mlx-forge convert hunyuan3d-2.1 --output ./models/hunyuan3d-2.1-mlx
-
-# For INT8 quantized (smaller, fits 16GB Macs)
-mlx-forge convert hunyuan3d-2.1 --quantize --bits 8 --output ./models/hunyuan3d-2.1-mlx-q8
+# or quantized for 16GB Macs:
+mlx-forge convert hunyuan3d-2.1 --quantize --bits 8 --output ./models/hunyuan3d-2.1-mlx
 ```
 
-### Generate a 3D Mesh
+Override the default HF lookup by setting `HUNYUAN3D_MLX_WEIGHTS_DIR=/path/to/local/models`.
+
+### Install
+
+```bash
+pip install mlx mlx-ops safetensors Pillow trimesh scikit-image PyMCubes scipy
+pip install huggingface_hub xatlas opencv-python  # for Stage 2
+```
+
+### Stage 1 — Shape Generation (image → mesh)
 
 ```python
 from hy3dshape.hy3dshape.pipeline_mlx import ShapePipeline
 
-pipe = ShapePipeline.from_pretrained("./models/hunyuan3d-2.1-mlx")
+pipe = ShapePipeline.from_pretrained("dgrauet/hunyuan3d-2.1-mlx")
 mesh = pipe("your_image.png", num_inference_steps=50, guidance_scale=7.5, octree_resolution=256)
 mesh.export("output.glb")
 ```
+
+### Stage 2 — PBR Texture Synthesis (mesh + reference → textured GLB)
+
+```python
+from textureGenPipeline_mlx import Hunyuan3DPaintConfigMLX, Hunyuan3DPaintPipelineMLX
+
+cfg = Hunyuan3DPaintConfigMLX(max_num_view=6, resolution=512)
+pipe = Hunyuan3DPaintPipelineMLX(cfg)
+pipe(
+    mesh_path="mesh.glb",
+    image_path="reference.png",
+    output_mesh_path="textured.obj",
+    save_glb=True,
+)
+```
+
+Output: `textured.glb` with 1024² PBR albedo + metallic-roughness textures baked onto the mesh UVs (~7 min for 6 views at 512px on an M2, ~425s denoising + bake + inpaint).
 
 ### Memory Requirements
 
@@ -58,10 +85,13 @@ mesh.export("output.glb")
 | INT8      | 3.0 GB   | ~6 GB       | 16 GB+          |
 | INT4      | 1.6 GB   | ~4 GB       | 16 GB           |
 
+Stage 2 (paint) adds ~6 GB peak for the UNet + VAE + DINOv2 at fp32.
+
 ### Scope
 
-- Stage 1 (shape generation): fully ported to MLX
-- Stage 2 (PBR texture): not yet ported (uses original PyTorch code)
+- ✅ Stage 1 (shape generation): fully ported to MLX
+- ✅ Stage 2 (PBR texture synthesis): fully ported to MLX — rasterizer (Metal), UNet 2.5D with dual-stream reference attention, VAE, DINOv2, scheduler, back-projection bake, UV inpaint
+- ⚠️ RealESRGAN super-resolution pass (between diffusion and bake) is optional and not yet ported — output is 512² per view instead of 2048² on the PyTorch path
 
 ---
 

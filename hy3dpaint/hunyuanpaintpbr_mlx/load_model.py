@@ -175,7 +175,15 @@ def extract_reference_features(
     # Forward pass at timestep 0 (frozen reference).
     # The _capture_dict kwarg is propagated through UNet -> blocks -> transformer
     # blocks via **kwargs.
-    _ = unet(unet_input, mx.array([0]), ref_text, _capture_dict=capture_dict)
+    _ = unet(
+        unet_input,
+        mx.array([0]),
+        ref_text,
+        _capture_dict=capture_dict,
+        _ref_n_views=1,
+        n_views=0,   # disable multiview / MDA paths during capture
+        n_pbr=1,
+    )
     mx.synchronize()
 
     return capture_dict

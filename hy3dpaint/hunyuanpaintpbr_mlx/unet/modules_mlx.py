@@ -335,7 +335,7 @@ class Transformer2p5DModel(nn.Module):
         inner_dim = num_attention_heads * attention_head_dim
         self.in_channels = in_channels
 
-        self.norm = nn.GroupNorm(norm_num_groups, in_channels)
+        self.norm = nn.GroupNorm(norm_num_groups, in_channels, pytorch_compatible=True)
         self.proj_in = nn.Linear(in_channels, inner_dim)
 
         self.transformer_blocks = [

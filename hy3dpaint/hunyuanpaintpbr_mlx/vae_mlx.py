@@ -21,9 +21,9 @@ class ResnetBlock2D(nn.Module):
 
     def __init__(self, in_channels: int, out_channels: int, num_groups: int = 32):
         super().__init__()
-        self.norm1 = nn.GroupNorm(num_groups, in_channels)
+        self.norm1 = nn.GroupNorm(num_groups, in_channels, pytorch_compatible=True)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.norm2 = nn.GroupNorm(num_groups, out_channels)
+        self.norm2 = nn.GroupNorm(num_groups, out_channels, pytorch_compatible=True)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
 
         if in_channels != out_channels:
@@ -56,7 +56,7 @@ class AttentionBlock(nn.Module):
 
     def __init__(self, channels: int, num_groups: int = 32):
         super().__init__()
-        self.group_norm = nn.GroupNorm(num_groups, channels)
+        self.group_norm = nn.GroupNorm(num_groups, channels, pytorch_compatible=True)
         self.to_q = nn.Linear(channels, channels)
         self.to_k = nn.Linear(channels, channels)
         self.to_v = nn.Linear(channels, channels)
@@ -218,7 +218,7 @@ class Encoder(nn.Module):
 
         self.mid_block = MidBlock2D(block_out_channels[-1])
 
-        self.conv_norm_out = nn.GroupNorm(32, block_out_channels[-1])
+        self.conv_norm_out = nn.GroupNorm(32, block_out_channels[-1], pytorch_compatible=True)
         # 2 * latent_channels for mean + logvar
         self.conv_out = nn.Conv2d(block_out_channels[-1], 2 * latent_channels, kernel_size=3, padding=1)
 
@@ -260,7 +260,7 @@ class Decoder(nn.Module):
                 UpDecoderBlock2D(in_ch, out_ch, num_layers=3, add_upsample=add_upsample)
             )
 
-        self.conv_norm_out = nn.GroupNorm(32, reversed_channels[-1])
+        self.conv_norm_out = nn.GroupNorm(32, reversed_channels[-1], pytorch_compatible=True)
         self.conv_out = nn.Conv2d(reversed_channels[-1], out_channels, kernel_size=3, padding=1)
 
     def __call__(self, z: mx.array) -> mx.array:

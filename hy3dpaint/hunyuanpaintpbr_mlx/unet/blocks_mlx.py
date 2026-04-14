@@ -15,9 +15,12 @@ import mlx.nn as nn
 # ---------------------------------------------------------------------------
 
 def get_timestep_embedding(timesteps: mx.array, embedding_dim: int) -> mx.array:
-    """Sinusoidal timestep embedding (B,) → (B, embedding_dim)."""
+    """Sinusoidal timestep embedding (B,) → (B, embedding_dim).
+
+    Matches diffusers convention with downscale_freq_shift=0 (SD 2.1).
+    """
     half_dim = embedding_dim // 2
-    emb = math.log(10000) / (half_dim - 1)
+    emb = math.log(10000) / half_dim  # was / (half_dim - 1) — off-by-one bug
     emb = mx.exp(mx.arange(half_dim, dtype=mx.float32) * -emb)
     emb = timesteps[:, None].astype(mx.float32) * emb[None, :]
     emb = mx.concatenate([mx.cos(emb), mx.sin(emb)], axis=-1)
@@ -61,9 +64,9 @@ class ResnetBlock2D(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        self.norm1 = nn.GroupNorm(groups, in_channels)
+        self.norm1 = nn.GroupNorm(groups, in_channels, pytorch_compatible=True)
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
-        self.norm2 = nn.GroupNorm(groups, out_channels)
+        self.norm2 = nn.GroupNorm(groups, out_channels, pytorch_compatible=True)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         self.nonlinearity = nn.SiLU()
 
@@ -229,11 +232,24 @@ class BasicTransformerBlock(nn.Module):
         n_pbr = kwargs.get("n_pbr", 2)
         has_25d = hasattr(self, "attn_multiview")
 
-        # --- Capture mode: store post-self-attn features for reference ---
+        # --- Capture mode: store post-norm1 (pre-attn1) features for reference ---
         _capture_dict = kwargs.get("_capture_dict")
 
         # --- Step 1: Self-attention (with MDA if available) ---
         norm_hs = self.norm1(hidden_states)
+
+        # --- Capture: write mode (BEFORE attn1 output is applied) ---
+        # Matches PyTorch: condition_embed_dict[layer_name] =
+        #   rearrange(norm_hidden_states, "(b n) l c -> b (n l) c", n=num_in_batch)
+        if _capture_dict is not None:
+            block_id = getattr(self, "_block_id", "unknown")
+            B_total, L, C = norm_hs.shape
+            # For ref extraction, n_views=1 => (B, L, C) unchanged.
+            ref_n = kwargs.get("_ref_n_views", 1)
+            if ref_n < 1:
+                ref_n = 1
+            reshaped = norm_hs.reshape(B_total // ref_n, ref_n * L, C)
+            _capture_dict[block_id] = reshaped
 
         if has_25d and hasattr(self.attn1, "processor") and n_views > 0:
             # MDA: process each material separately with its own projections
@@ -273,29 +289,47 @@ class BasicTransformerBlock(nn.Module):
 
         hidden_states = attn_out + hidden_states
 
-        # If in capture mode, store post-self-attn hidden states and return
-        # early (reference extraction only needs features up to this point).
-        if _capture_dict is not None:
-            block_id = getattr(self, "_block_id", "unknown")
-            _capture_dict[block_id] = hidden_states
-            # Still run remaining layers so the forward pass produces valid
-            # output for downstream blocks, but we already captured what we need.
-
         # --- Step 2: Reference attention (if features provided) ---
+        # Matches PyTorch modules.py lines 586-609:
+        #   query = rearrange(norm_hidden_states,
+        #                     "(b n_pbr n) l c -> b n_pbr (n l) c")[:, 0]  # albedo only
+        #   out   = attn_refview(query, condition_embed)
+        #   scatter back to albedo samples; MR samples get zero (processed
+        #   inside attn_refview via processor for material-specific V/out, but
+        #   the MLX port uses albedo-only residual here)
         ref_features = kwargs.get("ref_features")
         if has_25d and hasattr(self, "attn_refview") and ref_features is not None:
-            # ref_features is a dict keyed by _block_id (str).
             block_id = getattr(self, "_block_id", None)
             if block_id is not None and block_id in ref_features:
-                ref_ctx = ref_features[block_id]  # (1, L_ref, C)
-                # Broadcast ref context to batch size
-                if ref_ctx.shape[0] < hidden_states.shape[0]:
+                ref_ctx = ref_features[block_id]  # (B_ref, n_ref*L, C)
+                B_total, L, C = hidden_states.shape
+                # n_views > 0 and n_pbr set by inference loop
+                nv = max(int(n_views) if n_views else 1, 1)
+                np_ = max(int(n_pbr) if n_pbr else 1, 1)
+                B_batch = B_total // (np_ * nv)
+                # Reshape: (B*n_pbr*n_views, L, C) -> (B, n_pbr, n_views, L, C)
+                # layout must match inference ordering: [albedo_v0..vN-1, mr_v0..vN-1]
+                # which in (b, n_pbr, n) indexing is b-major, then n_pbr, then n.
+                nh = norm_hs.reshape(B_batch, np_, nv, L, C)
+                # Albedo only, views concatenated into sequence: (B, n*L, C)
+                query_albedo = nh[:, 0].reshape(B_batch, nv * L, C)
+
+                # Broadcast ref context if needed
+                if ref_ctx.shape[0] < query_albedo.shape[0]:
                     ref_ctx = mx.broadcast_to(
-                        ref_ctx, (hidden_states.shape[0],) + ref_ctx.shape[1:]
+                        ref_ctx,
+                        (query_albedo.shape[0],) + ref_ctx.shape[1:],
                     )
-                norm_hs = self.norm1(hidden_states)
-                ref_attn = self.attn_refview(norm_hs, ref_ctx)
-                hidden_states = ref_attn + hidden_states
+
+                ref_out = self.attn_refview(query_albedo, ref_ctx)  # (B, nv*L, C)
+                ref_out = ref_out.reshape(B_batch, 1, nv, L, C)
+                if np_ > 1:
+                    zeros = mx.zeros((B_batch, np_ - 1, nv, L, C), dtype=ref_out.dtype)
+                    ref_out_full = mx.concatenate([ref_out, zeros], axis=1)
+                else:
+                    ref_out_full = ref_out
+                ref_out_flat = ref_out_full.reshape(B_total, L, C)
+                hidden_states = hidden_states + ref_out_flat
 
         # --- Step 3: Multiview attention ---
         if has_25d and n_views > 1:
@@ -369,7 +403,7 @@ class Transformer2DModel(nn.Module):
         inner_dim = num_attention_heads * attention_head_dim
         self.in_channels = in_channels
 
-        self.norm = nn.GroupNorm(norm_num_groups, in_channels)
+        self.norm = nn.GroupNorm(norm_num_groups, in_channels, pytorch_compatible=True)
         self.proj_in = nn.Linear(in_channels, inner_dim)
 
         self.transformer_blocks = [

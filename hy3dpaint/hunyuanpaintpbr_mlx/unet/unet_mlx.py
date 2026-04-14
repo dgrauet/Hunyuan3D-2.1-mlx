@@ -150,7 +150,7 @@ class UNet2DConditionModelMLX(nn.Module):
                 )
 
         # Output
-        self.conv_norm_out = nn.GroupNorm(32, block_out_channels[0])
+        self.conv_norm_out = nn.GroupNorm(32, block_out_channels[0], pytorch_compatible=True)
         self.conv_act = nn.SiLU()
         self.conv_out = nn.Conv2d(block_out_channels[0], out_channels, 3, padding=1)
 

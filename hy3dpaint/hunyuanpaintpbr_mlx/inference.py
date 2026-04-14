@@ -104,20 +104,25 @@ def generate_multiview_pbr(
     mx.synchronize()
 
     # ------------------------------------------------------------------
-    # 2b. Reference features — DISABLED
-    # The capture point differs from PyTorch (post-residual vs post-norm1)
-    # which produces incorrect features that blocks denoising convergence.
-    # TODO: fix capture point to match PyTorch norm_hidden_states
-    # ------------------------------------------------------------------
-    ref_features = None
-
-    # ------------------------------------------------------------------
     # 3. Text embeddings for CFG
     # ------------------------------------------------------------------
     # Per-material learned tokens
     text_albedo = model.learned_text_clip["albedo"]  # (77, 1024)
     text_mr = model.learned_text_clip["mr"]
     text_neg = mx.zeros_like(text_albedo)
+
+    # ------------------------------------------------------------------
+    # 2b. Reference features — capture norm_hidden_states from each
+    #     transformer block by running a single forward pass on the
+    #     reference image latent.  Matches PyTorch mode "w".
+    # ------------------------------------------------------------------
+    print("  Extracting reference features...")
+    ref_latent = encode_images([reference_image])  # (1, h, w, 4)
+    ref_text_batch = text_albedo[None]  # (1, 77, 1024)
+    ref_features = extract_reference_features(
+        model.unet, ref_latent, ref_text_batch
+    )
+    mx.synchronize()
 
     # Build per-sample text: (N_pbr * N_views, 77, 1024)
     # Order: [albedo_v0, albedo_v1, ..., mr_v0, mr_v1, ...]

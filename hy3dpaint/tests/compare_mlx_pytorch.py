@@ -24,10 +24,18 @@ PT_UNET_DIR = "/Users/dgrauet/Work/mlx-forge/downloads/hunyuan3d-2.1/hunyuan3d-p
 PT_VAE_DIR = "/Users/dgrauet/Work/mlx-forge/downloads/hunyuan3d-2.1/hunyuan3d-paintpbr-v2-1/vae/"
 MLX_WEIGHTS_DIR = "/Users/dgrauet/Work/mlx-forge/models/hunyuan3d-2.1-mlx"
 
-# Latent size (small to fit both models in memory alongside both models)
+# Latent size (small so both models fit comfortably)
 LATENT_H, LATENT_W = 8, 8
+IN_CHANNELS = 12          # 4 latent + 4 normal + 4 position
+TEXT_LEN = 77
+CROSS_DIM = 1024
 SEED = 42
+TOL = 0.01
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def separator(title: str):
     print(f"\n{'=' * 70}")
@@ -35,604 +43,716 @@ def separator(title: str):
     print(f"{'=' * 70}\n")
 
 
-def compare_tensors(name: str, pt_np: np.ndarray, mlx_np: np.ndarray, detail: bool = True):
-    """Compare two numpy arrays and print diagnostics."""
+def compare_tensors(name: str, pt_np: np.ndarray, mlx_np: np.ndarray,
+                    tol: float = TOL, detail: bool = True) -> dict:
+    """Compare two numpy arrays, print a MATCH/MISMATCH verdict, return stats."""
+    result = {"name": name, "pt_shape": pt_np.shape, "mlx_shape": mlx_np.shape}
     if pt_np.shape != mlx_np.shape:
         print(f"  [{name}] SHAPE MISMATCH: PT {pt_np.shape} vs MLX {mlx_np.shape}")
-        return
+        result["status"] = "SHAPE_MISMATCH"
+        return result
 
     diff = np.abs(pt_np - mlx_np)
-    max_diff = diff.max()
-    mean_diff = diff.mean()
-    pt_norm = np.linalg.norm(pt_np.ravel())
-    mlx_norm = np.linalg.norm(mlx_np.ravel())
+    max_diff = float(diff.max())
+    mean_diff = float(diff.mean())
+    denom = np.maximum(np.abs(pt_np), 1e-8)
+    rel = diff / denom
+    max_rel = float(rel.max())
+    pt_norm = float(np.linalg.norm(pt_np.ravel()))
+    mlx_norm = float(np.linalg.norm(mlx_np.ravel()))
 
-    status = "OK" if max_diff < 0.01 else ("WARN" if max_diff < 0.1 else "FAIL")
-    print(f"  [{name}] max_diff={max_diff:.6e}  mean_diff={mean_diff:.6e}  "
+    status = "MATCH" if max_diff < tol else "MISMATCH"
+    print(f"  [{name}] shape={pt_np.shape}  max_abs={max_diff:.6e}  "
+          f"max_rel={max_rel:.6e}  mean_abs={mean_diff:.6e}  "
           f"pt_norm={pt_norm:.4f}  mlx_norm={mlx_norm:.4f}  [{status}]")
-    if detail and max_diff > 0.001:
-        # Show where the biggest differences are
-        flat_idx = np.argmax(diff.ravel())
+    if detail and max_diff > tol:
+        flat_idx = int(np.argmax(diff.ravel()))
         coords = np.unravel_index(flat_idx, diff.shape)
-        print(f"         worst at {coords}: PT={pt_np[coords]:.6f} MLX={mlx_np[coords]:.6f}")
-        # Show first few values
-        pt_flat = pt_np.ravel()[:8]
-        mlx_flat = mlx_np.ravel()[:8]
-        print(f"         first 8 PT:  {pt_flat}")
-        print(f"         first 8 MLX: {mlx_flat}")
+        print(f"         worst at {coords}: PT={pt_np[coords]:.6f} "
+              f"MLX={mlx_np[coords]:.6f}")
+        print(f"         first 6 PT : {pt_np.ravel()[:6]}")
+        print(f"         first 6 MLX: {mlx_np.ravel()[:6]}")
+
+    result.update({
+        "status": status,
+        "max_abs": max_diff,
+        "max_rel": max_rel,
+        "mean_abs": mean_diff,
+        "pt_norm": pt_norm,
+        "mlx_norm": mlx_norm,
+    })
+    return result
 
 
 def pt_to_nhwc(t):
     """Convert PyTorch NCHW tensor to NHWC numpy."""
-    return t.detach().cpu().float().numpy().transpose(0, 2, 3, 1)
+    import torch  # noqa: F401
+    arr = t.detach().cpu().float().numpy()
+    if arr.ndim == 4:
+        return arr.transpose(0, 2, 3, 1)
+    return arr
 
 
 def nhwc_to_nchw(arr):
-    """Convert NHWC numpy to NCHW numpy."""
     return arr.transpose(0, 3, 1, 2)
 
 
-# ============================================================================
-# Part 1: Weight Comparison
-# ============================================================================
-
-def compare_weights():
-    separator("WEIGHT COMPARISON")
-
-    import torch
-    from diffusers import UNet2DConditionModel
+def mx_sync(x):
     import mlx.core as mx
-
-    print("Loading PyTorch UNet...")
-    unet_pt = UNet2DConditionModel.from_pretrained(PT_UNET_DIR, torch_dtype=torch.float32)
-
-    # The PyTorch model has in_channels=4, but the actual checkpoint was modified
-    # to have in_channels=12 for concat conditioning. Check what we got.
-    print(f"  PT UNet in_channels (config): {unet_pt.config.in_channels}")
-    print(f"  PT conv_in weight shape: {unet_pt.conv_in.weight.shape}")
-    pt_in_ch = unet_pt.conv_in.weight.shape[1]
-    print(f"  PT conv_in actual in_channels: {pt_in_ch}")
-
-    # Check attention head dims from config
-    print(f"  PT attention_head_dim: {unet_pt.config.attention_head_dim}")
-    print(f"  PT use_linear_projection: {unet_pt.config.use_linear_projection}")
-
-    print("\nLoading MLX UNet weights (raw safetensors)...")
-    mlx_raw = dict(mx.load(os.path.join(MLX_WEIGHTS_DIR, "paint_unet.safetensors")))
-
-    # Strip 'unet.' prefix
-    mlx_weights = {}
-    for k, v in mlx_raw.items():
-        if k.startswith("unet."):
-            mlx_weights[k[5:]] = v
-    del mlx_raw
-
-    # Compare specific weight tensors
-    pt_state = unet_pt.state_dict()
-
-    weight_keys_to_compare = [
-        "conv_in.weight",
-        "conv_in.bias",
-        "time_embedding.linear_1.weight",
-        "time_embedding.linear_1.bias",
-        "conv_out.weight",
-        "conv_out.bias",
-        "conv_norm_out.weight",
-    ]
-
-    # Also check first down block resnet
-    weight_keys_to_compare += [
-        "down_blocks.0.resnets.0.norm1.weight",
-        "down_blocks.0.resnets.0.conv1.weight",
-    ]
-
-    # Check first attention block
-    weight_keys_to_compare += [
-        "down_blocks.0.attentions.0.norm.weight",
-        "down_blocks.0.attentions.0.proj_in.weight",
-        "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.weight",
-    ]
-
-    for key in weight_keys_to_compare:
-        pt_key = key
-        mlx_key = key
-
-        if pt_key not in pt_state:
-            print(f"  [{key}] NOT IN PT state_dict")
-            continue
-        if mlx_key not in mlx_weights:
-            print(f"  [{key}] NOT IN MLX weights")
-            continue
-
-        pt_w = pt_state[pt_key].detach().cpu().float().numpy()
-        mlx_w = np.array(mlx_weights[mlx_key].astype(mx.float32))
-
-        # Conv weights: PT is (O, I, kH, kW), MLX is (O, kH, kW, I)
-        if pt_w.ndim == 4:
-            # Transpose PT to MLX layout for comparison
-            pt_w_nhwc = pt_w.transpose(0, 2, 3, 1)
-            compare_tensors(f"weight:{key} (PT->OHWI)", pt_w_nhwc, mlx_w)
-        elif pt_w.ndim == 2 and "norm" not in key:
-            # Linear: PT is (out, in), MLX nn.Linear stores (out, in) by default
-            # BUT mlx-forge conversion transposes linear weights
-            # Check both orientations to find which one matches
-            if pt_w.shape == mlx_w.shape:
-                compare_tensors(f"weight:{key} (same shape)", pt_w, mlx_w)
-            elif pt_w.shape == mlx_w.T.shape:
-                compare_tensors(f"weight:{key} (PT vs MLX.T)", pt_w, mlx_w.T)
-            else:
-                print(f"  [weight:{key}] SHAPE MISMATCH: PT {pt_w.shape} vs MLX {mlx_w.shape}")
-        else:
-            compare_tensors(f"weight:{key}", pt_w, mlx_w)
-
-    # Check for use_linear_projection mismatch
-    if hasattr(unet_pt.down_blocks[0].attentions[0], 'proj_in'):
-        proj_in = unet_pt.down_blocks[0].attentions[0].proj_in
-        print(f"\n  PT proj_in type: {type(proj_in).__name__}")
-        print(f"  PT proj_in weight shape: {proj_in.weight.shape}")
-
-    del unet_pt, pt_state, mlx_weights
-    gc.collect()
+    mx.eval(x)
 
 
-# ============================================================================
-# Part 2: Attention Head Dim Analysis
-# ============================================================================
+# ---------------------------------------------------------------------------
+# PyTorch UNet loader: force in_channels=12 despite config saying 4
+# ---------------------------------------------------------------------------
 
-def check_attention_head_dims():
-    separator("ATTENTION HEAD DIM ANALYSIS")
+def load_pt_unet():
+    """Build a fresh UNet2DConditionModel (in_channels=12) and load matching
+    weights from the bundled checkpoint.
 
+    The checkpoint stores the full 2.5D model with keys prefixed ``unet.``
+    (plus an extra ``unet_dual.`` copy). We strip the prefix, drop keys that
+    don't correspond to standard diffusers UNet submodules, and load only the
+    matching subset. Everything extra (``attn_multiview``, ``attn_refview``,
+    ``.transformer.``, ``_mr``, etc.) is simply ignored.
+    """
     import torch
     from diffusers import UNet2DConditionModel
 
-    unet_pt = UNet2DConditionModel.from_pretrained(PT_UNET_DIR, torch_dtype=torch.float32)
+    # Read config and override in_channels=12
+    import json
+    with open(os.path.join(PT_UNET_DIR, "config.json")) as f:
+        cfg = json.load(f)
+    cfg["in_channels"] = IN_CHANNELS
+    # Remove diffusers-internal keys that from_config dislikes
+    cfg_clean = {k: v for k, v in cfg.items() if not k.startswith("_")}
 
-    print("PyTorch UNet attention config:")
-    print(f"  attention_head_dim: {unet_pt.config.attention_head_dim}")
-    print(f"  block_out_channels: {unet_pt.config.block_out_channels}")
-    print(f"  use_linear_projection: {unet_pt.config.use_linear_projection}")
+    unet_pt = UNet2DConditionModel.from_config(cfg_clean)
+    unet_pt = unet_pt.to(torch.float32)
+    unet_pt.eval()
+    assert unet_pt.conv_in.weight.shape[1] == IN_CHANNELS
 
-    # Check actual attention shapes in each block
-    for i, block in enumerate(unet_pt.down_blocks):
-        if hasattr(block, 'attentions') and len(block.attentions) > 0:
-            attn = block.attentions[0]
-            tb = attn.transformer_blocks[0]
-            q_weight = tb.attn1.to_q.weight
-            print(f"\n  down_blocks[{i}]:")
-            print(f"    channels: {unet_pt.config.block_out_channels[i]}")
-            print(f"    to_q weight shape: {q_weight.shape}")
-            print(f"    num_heads: {tb.attn1.heads}")
-            if hasattr(tb.attn1, 'head_dim'):
-                print(f"    head_dim: {tb.attn1.head_dim}")
+    # Load checkpoint
+    sd = torch.load(
+        os.path.join(PT_UNET_DIR, "diffusion_pytorch_model.bin"),
+        map_location="cpu",
+        weights_only=False,
+    )
 
-    # Mid block
-    if hasattr(unet_pt.mid_block, 'attentions'):
-        attn = unet_pt.mid_block.attentions[0]
-        tb = attn.transformer_blocks[0]
-        print(f"\n  mid_block:")
-        print(f"    to_q weight shape: {tb.attn1.to_q.weight.shape}")
-        print(f"    num_heads: {tb.attn1.heads}")
+    model_keys = set(unet_pt.state_dict().keys())
+    stripped: dict = {}
+    # In the 2.5D checkpoint, the vanilla BasicTransformerBlock lives one
+    # level deeper: ``transformer_blocks.0.transformer.<subkey>`` instead of
+    # ``transformer_blocks.0.<subkey>``. We rewrite those keys so they map
+    # onto the standard diffusers UNet state dict.
+    for k, v in sd.items():
+        if not k.startswith("unet."):
+            continue
+        nk = k[len("unet."):]
+        # Collapse the 2.5D wrapper: "...transformer_blocks.0.transformer.X"
+        # -> "...transformer_blocks.0.X"
+        nk2 = nk.replace(".transformer_blocks.0.transformer.",
+                         ".transformer_blocks.0.")
+        # Skip 2.5D-only extras: attn_multiview / attn_refview / attn_dino /
+        # attn1.processor / *_mr weights — these don't exist in a plain
+        # UNet2DConditionModel state dict.
+        if any(tag in nk2 for tag in (
+            ".attn_multiview.", ".attn_refview.", ".attn_dino.",
+            ".processor.",
+        )):
+            continue
+        if nk2 in model_keys:
+            stripped[nk2] = v
 
-    print("\n\nMLX UNet attention config:")
-    print("  attention_head_dim=8 (used as divisor to get num_heads)")
-    for i, ch in enumerate([320, 640, 1280, 1280]):
-        if i < 3:  # CrossAttn blocks
-            num_heads_mlx = ch // 8
-            dim_head_mlx = ch // num_heads_mlx
-            print(f"  down_blocks[{i}]: ch={ch}, num_heads={num_heads_mlx}, dim_head={dim_head_mlx}")
-
-    # Compare: what should it be vs what MLX computes
-    pt_head_dims = unet_pt.config.attention_head_dim
-    if isinstance(pt_head_dims, list):
-        print("\n  MISMATCH ANALYSIS:")
-        for i, (ch, hd) in enumerate(zip(unet_pt.config.block_out_channels, pt_head_dims)):
-            pt_heads = ch // hd
-            mlx_heads = ch // 8
-            print(f"    Block {i}: PT has {pt_heads} heads (dim_head={hd}), "
-                  f"MLX has {mlx_heads} heads (dim_head=8)")
-            if pt_heads != mlx_heads:
-                print(f"      *** DIFFERENT number of heads!")
-                print(f"      inner_dim is same ({ch}) but attention pattern differs")
-
-    del unet_pt
-    gc.collect()
-
-
-# ============================================================================
-# Part 3: Timestep Embedding Detail
-# ============================================================================
-
-def compare_timestep_embedding_detail():
-    separator("TIMESTEP EMBEDDING DETAIL (flip_sin_to_cos)")
-
-    import torch
-    import mlx.core as mx
-
-    # Diffusers default for SD 2.1: flip_sin_to_cos=True, downscale_freq_shift=0
-    from diffusers.models.embeddings import get_timestep_embedding as pt_get_timestep_embedding
-
-    from hunyuanpaintpbr_mlx.unet.blocks_mlx import get_timestep_embedding as mlx_get_timestep_embedding
-
-    t = 500.0
-    dim = 320
-
-    # PyTorch
-    emb_pt = pt_get_timestep_embedding(
-        torch.tensor([t]), dim, flip_sin_to_cos=True, downscale_freq_shift=0
-    ).numpy()[0]
-
-    # MLX
-    emb_mlx = np.array(mlx_get_timestep_embedding(mx.array([t]), dim))[0]
-
-    print(f"  PT  first 4 values: {emb_pt[:4]}")
-    print(f"  MLX first 4 values: {emb_mlx[:4]}")
-    print(f"  PT  values 160-163: {emb_pt[160:164]}")
-    print(f"  MLX values 160-163: {emb_mlx[160:164]}")
-
-    max_diff = np.abs(emb_pt - emb_mlx).max()
-    mean_diff = np.abs(emb_pt - emb_mlx).mean()
-    print(f"\n  Max diff: {max_diff:.6e}")
-    print(f"  Mean diff: {mean_diff:.6e}")
-
-    if max_diff > 0.01:
-        # Try the other ordering (swap sin/cos halves)
-        emb_mlx_swapped = np.concatenate([emb_mlx[160:], emb_mlx[:160]])
-        max_diff_swapped = np.abs(emb_pt - emb_mlx_swapped).max()
-        print(f"  Max diff (swapped halves): {max_diff_swapped:.6e}")
-        if max_diff_swapped < max_diff:
-            print("  *** SIN/COS ORDERING IS SWAPPED!")
-            print("  PT uses flip_sin_to_cos=True -> [cos, sin]")
-            print("  MLX code may have different ordering")
+    missing, unexpected = unet_pt.load_state_dict(stripped, strict=False)
+    print(f"  PT UNet: loaded {len(stripped)} weights "
+          f"(missing={len(missing)}, unexpected={len(unexpected)})")
+    if missing:
+        print(f"    first missing: {missing[:3]}")
+    return unet_pt
 
 
-# ============================================================================
-# Part 4: UNet Forward Pass Comparison
-# ============================================================================
+def load_mlx_unet_for_comparison():
+    """Create MLX UNet at in_channels=12 and load ONLY stock-UNet weights.
 
-def compare_unet_forward():
-    separator("UNET FORWARD PASS COMPARISON")
-
-    import torch
+    We do NOT call _enhance_unet here so that the MLX model matches the
+    plain diffusers UNet2DConditionModel topology (no 2.5D modules).
+    """
     import mlx.core as mx
     from mlx.utils import tree_flatten
-
-    from diffusers import UNet2DConditionModel
-    from hunyuanpaintpbr_mlx.load_model import _enhance_unet
     from hunyuanpaintpbr_mlx.unet.unet_mlx import UNet2DConditionModelMLX
-    from hunyuanpaintpbr_mlx.unet.blocks_mlx import get_timestep_embedding
 
-    # --- Create deterministic inputs ---
-    rng = np.random.RandomState(SEED)
-
-    # --- Load PyTorch UNet first to check actual in_channels ---
-    print("Loading PyTorch UNet...")
-    unet_pt = UNet2DConditionModel.from_pretrained(PT_UNET_DIR, torch_dtype=torch.float32)
-    unet_pt.eval()
-
-    pt_in_ch = unet_pt.conv_in.weight.shape[1]
-    print(f"  PT conv_in in_channels: {pt_in_ch}")
-
-    # Create inputs with the correct number of channels
-    sample_nhwc = rng.randn(1, LATENT_H, LATENT_W, pt_in_ch).astype(np.float32) * 0.1
-    text_np = rng.randn(1, 77, 1024).astype(np.float32) * 0.1
-    timestep_val = 500
-
-    # PT uses NCHW
-    sample_pt = torch.tensor(nhwc_to_nchw(sample_nhwc))
-    text_pt = torch.tensor(text_np)
-    timestep_pt = torch.tensor([timestep_val])
-
-    # --- Collect PT intermediate outputs ---
-    pt_intermediates = {}
-
-    def hook_conv_in(module, inp, output):
-        pt_intermediates["conv_in"] = output.detach()
-
-    def hook_down_block_0(module, inp, output):
-        if isinstance(output, tuple):
-            pt_intermediates["down_block_0"] = output[0].detach()
-        else:
-            pt_intermediates["down_block_0"] = output.detach()
-
-    def hook_mid_block(module, inp, output):
-        pt_intermediates["mid_block"] = output.detach()
-
-    h1 = unet_pt.conv_in.register_forward_hook(hook_conv_in)
-    h2 = unet_pt.down_blocks[0].register_forward_hook(hook_down_block_0)
-    h3 = unet_pt.mid_block.register_forward_hook(hook_mid_block)
-
-    print("Running PyTorch forward pass...")
-    with torch.no_grad():
-        out_pt = unet_pt(sample_pt, timestep_pt, encoder_hidden_states=text_pt)
-        out_pt_tensor = out_pt.sample
-
-    h1.remove()
-    h2.remove()
-    h3.remove()
-
-    pt_intermediates["final"] = out_pt_tensor.detach()
-
-    # Convert all PT intermediates to NHWC numpy
-    pt_results = {}
-    for k, v in pt_intermediates.items():
-        pt_results[k] = pt_to_nhwc(v)
-
-    print(f"  PT final output shape (NHWC): {pt_results['final'].shape}")
-    print(f"  PT final output stats: min={pt_results['final'].min():.4f} "
-          f"max={pt_results['final'].max():.4f} mean={pt_results['final'].mean():.4f}")
-
-    # Also get PT timestep embedding for comparison
-    from diffusers.models.embeddings import get_timestep_embedding as pt_get_timestep_embedding
-    pt_temb = pt_get_timestep_embedding(
-        torch.tensor([timestep_val]).float(), 320,
-        flip_sin_to_cos=True, downscale_freq_shift=0
-    )
-    pt_temb_proj = unet_pt.time_embedding(pt_temb)
-    pt_temb_np = pt_temb.detach().cpu().numpy()
-    pt_temb_proj_np = pt_temb_proj.detach().cpu().numpy()
-
-    # Free PT model
-    del unet_pt, out_pt, out_pt_tensor
-    gc.collect()
-    if torch.backends.mps.is_available():
-        torch.mps.empty_cache()
-
-    # --- Load MLX UNet ---
-    print("\nLoading MLX UNet...")
     unet_mlx = UNet2DConditionModelMLX(
-        in_channels=pt_in_ch, out_channels=4,
+        in_channels=IN_CHANNELS,
+        out_channels=4,
         block_out_channels=(320, 640, 1280, 1280),
-        cross_attention_dim=1024,
-        attention_head_dim=8,
+        cross_attention_dim=CROSS_DIM,
+        attention_head_dim=(5, 10, 20, 20),  # matches PT config
     )
-    _enhance_unet(unet_mlx, cross_attention_dim=1024)
 
-    # Load weights
     unet_w = dict(mx.load(os.path.join(MLX_WEIGHTS_DIR, "paint_unet.safetensors")))
     stripped = {}
     for k, v in unet_w.items():
         if k.startswith("unet."):
             stripped[k[5:]] = v
 
-    normalized = {}
-    for k, v in stripped.items():
-        nk = k.replace(".to_out_mr.0.", ".to_out_mr.")
-        nk = nk.replace(".to_out_albedo.0.", ".to_out_albedo.")
-        normalized[nk] = v
-
     model_keys = set(k for k, _ in tree_flatten(unet_mlx.parameters()))
-    matched = [(k, v) for k, v in normalized.items() if k in model_keys]
+    matched = [(k, v) for k, v in stripped.items() if k in model_keys]
     unet_mlx.load_weights(matched)
-    n_loaded = len(matched)
-    n_total = len(stripped)
-    print(f"  Loaded {n_loaded}/{n_total} MLX weights")
 
-    # Show some unmatched keys
-    matched_keys = set(k for k, _ in matched)
-    unmatched = [k for k in normalized if k not in matched_keys and not k.startswith("learned_text_clip") and not k.startswith("image_proj")]
-    if unmatched:
-        print(f"  First 10 unmatched keys: {unmatched[:10]}")
-    del unet_w, stripped, normalized
-
-    # Cast to float32 for comparison
-    float32_params = [(k, v.astype(mx.float32)) for k, v in tree_flatten(unet_mlx.parameters())]
+    # cast to fp32 for fair comparison
+    float32_params = [(k, v.astype(mx.float32))
+                      for k, v in tree_flatten(unet_mlx.parameters())]
     unet_mlx.load_weights(float32_params)
-    del float32_params
 
-    # --- MLX forward pass with intermediates ---
+    n_total = len(stripped)
+    n_loaded = len(matched)
+    print(f"  Loaded {n_loaded}/{n_total} MLX UNet weights "
+          f"(ignored {n_total - n_loaded} 2.5D/extra tensors)")
+    return unet_mlx
+
+
+# ---------------------------------------------------------------------------
+# Part 1: Weight spot-check
+# ---------------------------------------------------------------------------
+
+def compare_weights(results: list):
+    separator("PART 1: WEIGHT SPOT CHECK")
+
+    import mlx.core as mx
+
+    unet_pt = load_pt_unet()
+    pt_state = unet_pt.state_dict()
+
+    print(f"  PT UNet in_channels (weight): {unet_pt.conv_in.weight.shape[1]}")
+    print(f"  PT attention_head_dim (config): {unet_pt.config.attention_head_dim}")
+    print(f"  PT use_linear_projection: {unet_pt.config.use_linear_projection}")
+
+    mlx_raw = dict(mx.load(os.path.join(MLX_WEIGHTS_DIR, "paint_unet.safetensors")))
+    mlx_weights = {}
+    for k, v in mlx_raw.items():
+        if k.startswith("unet."):
+            mlx_weights[k[5:]] = v
+    del mlx_raw
+
+    keys = [
+        "conv_in.weight",
+        "conv_in.bias",
+        "time_embedding.linear_1.weight",
+        "time_embedding.linear_1.bias",
+        "time_embedding.linear_2.weight",
+        "conv_out.weight",
+        "conv_out.bias",
+        "conv_norm_out.weight",
+        "down_blocks.0.resnets.0.norm1.weight",
+        "down_blocks.0.resnets.0.conv1.weight",
+        "down_blocks.0.resnets.0.time_emb_proj.weight",
+        "down_blocks.0.attentions.0.norm.weight",
+        "down_blocks.0.attentions.0.proj_in.weight",
+        "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.weight",
+        "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_k.weight",
+        "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_v.weight",
+        "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_out.0.weight",
+        "mid_block.attentions.0.transformer_blocks.0.attn1.to_q.weight",
+    ]
+
+    for key in keys:
+        if key not in pt_state:
+            print(f"  [{key}] NOT IN PT state_dict")
+            continue
+        if key not in mlx_weights:
+            print(f"  [{key}] NOT IN MLX weights")
+            continue
+
+        pt_w = pt_state[key].detach().cpu().float().numpy()
+        mlx_w = np.array(mlx_weights[key].astype(mx.float32))
+
+        if pt_w.ndim == 4:
+            # PT (O, I, kH, kW) -> MLX (O, kH, kW, I)
+            pt_w_n = pt_w.transpose(0, 2, 3, 1)
+            results.append(compare_tensors(f"W:{key}", pt_w_n, mlx_w))
+        elif pt_w.ndim == 2:
+            if pt_w.shape == mlx_w.shape:
+                results.append(compare_tensors(f"W:{key}", pt_w, mlx_w))
+            elif pt_w.T.shape == mlx_w.shape:
+                results.append(compare_tensors(f"W:{key}(T)", pt_w.T, mlx_w))
+            else:
+                print(f"  [W:{key}] SHAPE MISMATCH: PT {pt_w.shape} MLX {mlx_w.shape}")
+        else:
+            results.append(compare_tensors(f"W:{key}", pt_w, mlx_w))
+
+    del unet_pt, pt_state, mlx_weights
+    gc.collect()
+
+
+# ---------------------------------------------------------------------------
+# Part 2: Attention head dim analysis
+# ---------------------------------------------------------------------------
+
+def check_attention_head_dims():
+    separator("PART 2: ATTENTION HEAD DIM ANALYSIS")
+
+    unet_pt = load_pt_unet()
+
+    print(f"  PT config.attention_head_dim: {unet_pt.config.attention_head_dim}")
+    for i, block in enumerate(unet_pt.down_blocks):
+        if hasattr(block, "attentions") and len(block.attentions) > 0:
+            tb = block.attentions[0].transformer_blocks[0]
+            print(f"  down_blocks[{i}]: channels={unet_pt.config.block_out_channels[i]}, "
+                  f"heads={tb.attn1.heads}, to_q={tuple(tb.attn1.to_q.weight.shape)}")
+
+    if hasattr(unet_pt.mid_block, "attentions"):
+        tb = unet_pt.mid_block.attentions[0].transformer_blocks[0]
+        print(f"  mid_block: heads={tb.attn1.heads}, "
+              f"to_q={tuple(tb.attn1.to_q.weight.shape)}")
+
+    del unet_pt
+    gc.collect()
+
+
+# ---------------------------------------------------------------------------
+# Part 3: Timestep embedding detail
+# ---------------------------------------------------------------------------
+
+def compare_timestep_embedding_detail(results: list):
+    separator("PART 3: TIMESTEP EMBEDDING")
+    import torch
+    import mlx.core as mx
+    from diffusers.models.embeddings import get_timestep_embedding as pt_get
+    from hunyuanpaintpbr_mlx.unet.blocks_mlx import get_timestep_embedding as mlx_get
+
+    t = 500.0
+    dim = 320
+
+    emb_pt = pt_get(torch.tensor([t]), dim,
+                    flip_sin_to_cos=True, downscale_freq_shift=0).numpy()[0]
+    emb_mlx = np.array(mlx_get(mx.array([t]), dim))[0]
+
+    results.append(compare_tensors("timestep_sinusoidal", emb_pt, emb_mlx))
+
+
+# ---------------------------------------------------------------------------
+# Part 4: UNet forward pass comparison
+# ---------------------------------------------------------------------------
+
+def compare_unet_forward(results: list) -> dict:
+    separator("PART 4: UNET FORWARD PASS")
+
+    import torch
+    import mlx.core as mx
+
+    # --- Deterministic inputs ---
+    rng = np.random.RandomState(SEED)
+    sample_nhwc = rng.randn(1, LATENT_H, LATENT_W, IN_CHANNELS).astype(np.float32) * 0.1
+    text_np = np.zeros((1, TEXT_LEN, CROSS_DIM), dtype=np.float32)
+    timestep_val = 500
+
+    sample_pt = torch.tensor(nhwc_to_nchw(sample_nhwc))
+    text_pt = torch.tensor(text_np)
+    timestep_pt = torch.tensor([timestep_val])
+
+    # --- PyTorch ---
+    print("Loading PyTorch UNet...")
+    unet_pt = load_pt_unet()
+
+    pt_intermediates: dict = {}
+
+    def mk_hook(name, is_block=False):
+        def _h(module, inp, output):
+            val = output[0] if (is_block and isinstance(output, tuple)) else output
+            pt_intermediates[name] = val.detach()
+        return _h
+
+    handles = []
+    handles.append(unet_pt.conv_in.register_forward_hook(mk_hook("conv_in")))
+    handles.append(unet_pt.down_blocks[0].register_forward_hook(
+        mk_hook("down_block_0", is_block=True)))
+    handles.append(unet_pt.mid_block.register_forward_hook(mk_hook("mid_block")))
+    handles.append(unet_pt.up_blocks[0].register_forward_hook(mk_hook("up_block_0")))
+    handles.append(unet_pt.conv_out.register_forward_hook(mk_hook("conv_out")))
+
+    print("Running PyTorch forward pass...")
+    with torch.no_grad():
+        out_pt = unet_pt(sample_pt, timestep_pt, encoder_hidden_states=text_pt).sample
+    for h in handles:
+        h.remove()
+
+    pt_intermediates["final"] = out_pt.detach()
+    pt_results = {k: pt_to_nhwc(v) for k, v in pt_intermediates.items()}
+
+    print(f"  PT final (NHWC): {pt_results['final'].shape}  "
+          f"min={pt_results['final'].min():.4f} max={pt_results['final'].max():.4f}")
+
+    del unet_pt, out_pt
+    gc.collect()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+    # --- MLX ---
+    print("\nLoading MLX UNet...")
+    unet_mlx = load_mlx_unet_for_comparison()
+
+    from hunyuanpaintpbr_mlx.unet.blocks_mlx import get_timestep_embedding
+
     sample_mlx = mx.array(sample_nhwc)
     text_mlx = mx.array(text_np)
     timestep_mlx = mx.array([timestep_val])
 
-    mlx_results = {}
+    mlx_results: dict = {}
 
-    # Timestep embedding comparison
+    # Timestep embedding
     t_emb = get_timestep_embedding(timestep_mlx, unet_mlx.time_proj_dim)
-    t_emb_np = np.array(t_emb)
-    compare_tensors("timestep_sinusoidal", pt_temb_np, t_emb_np)
-
     emb = unet_mlx.time_embedding(t_emb)
-    emb_np = np.array(emb)
-    compare_tensors("timestep_projected", pt_temb_proj_np, emb_np)
+    mx_sync(emb)
 
     # Step 1: conv_in
-    conv_in_out = unet_mlx.conv_in(sample_mlx)
-    mx_sync(conv_in_out)
-    mlx_results["conv_in"] = np.array(conv_in_out)
+    x = unet_mlx.conv_in(sample_mlx)
+    mx_sync(x)
+    mlx_results["conv_in"] = np.array(x)
 
-    # Step 2: First down block
-    sample_running = conv_in_out
-    down_block_res_samples = [sample_running]
-
+    # Step 2: down blocks (capture first)
+    down_res = [x]
     block = unet_mlx.down_blocks[0]
-    if hasattr(block, "has_cross_attention") and block.has_cross_attention:
-        sample_running, res = block(sample_running, emb, text_mlx)
+    if getattr(block, "has_cross_attention", False):
+        x, res = block(x, emb, text_mlx)
     else:
-        sample_running, res = block(sample_running, emb)
-    down_block_res_samples.extend(res)
-    mx_sync(sample_running)
-    mlx_results["down_block_0"] = np.array(sample_running)
+        x, res = block(x, emb)
+    down_res.extend(res)
+    mx_sync(x)
+    mlx_results["down_block_0"] = np.array(x)
 
-    # Continue through remaining down blocks
     for block in unet_mlx.down_blocks[1:]:
-        if hasattr(block, "has_cross_attention") and block.has_cross_attention:
-            sample_running, res = block(sample_running, emb, text_mlx)
+        if getattr(block, "has_cross_attention", False):
+            x, res = block(x, emb, text_mlx)
         else:
-            sample_running, res = block(sample_running, emb)
-        down_block_res_samples.extend(res)
+            x, res = block(x, emb)
+        down_res.extend(res)
 
-    # Step 3: Mid block
-    sample_running = unet_mlx.mid_block(sample_running, emb, text_mlx)
-    mx_sync(sample_running)
-    mlx_results["mid_block"] = np.array(sample_running)
+    # Step 3: mid
+    x = unet_mlx.mid_block(x, emb, text_mlx)
+    mx_sync(x)
+    mlx_results["mid_block"] = np.array(x)
 
-    # Step 4: Up blocks
+    # Step 4: up blocks (capture first)
+    first_up = True
     for block in unet_mlx.up_blocks:
         n_res = len(block.resnets)
-        res_samples = down_block_res_samples[-n_res:]
-        down_block_res_samples = down_block_res_samples[:-n_res]
-
-        if hasattr(block, "has_cross_attention") and block.has_cross_attention:
-            sample_running = block(sample_running, emb, res_samples, text_mlx)
+        res_samples = down_res[-n_res:]
+        down_res = down_res[:-n_res]
+        if getattr(block, "has_cross_attention", False):
+            x = block(x, emb, res_samples, text_mlx)
         else:
-            sample_running = block(sample_running, emb, res_samples)
+            x = block(x, emb, res_samples)
+        if first_up:
+            mx_sync(x)
+            mlx_results["up_block_0"] = np.array(x)
+            first_up = False
 
-    # Step 5: Output
-    sample_running = unet_mlx.conv_act(unet_mlx.conv_norm_out(sample_running))
-    sample_running = unet_mlx.conv_out(sample_running)
-    mx_sync(sample_running)
-    mlx_results["final"] = np.array(sample_running)
+    # Step 5: out
+    h = unet_mlx.conv_act(unet_mlx.conv_norm_out(x))
+    out = unet_mlx.conv_out(h)
+    mx_sync(out)
+    mlx_results["conv_out"] = np.array(out)
+    mlx_results["final"] = np.array(out)
 
-    print(f"\n  MLX final output shape: {mlx_results['final'].shape}")
-    print(f"  MLX final output stats: min={mlx_results['final'].min():.4f} "
-          f"max={mlx_results['final'].max():.4f} mean={mlx_results['final'].mean():.4f}")
+    print(f"  MLX final: {mlx_results['final'].shape}  "
+          f"min={mlx_results['final'].min():.4f} max={mlx_results['final'].max():.4f}")
 
-    # --- Compare ---
-    separator("LAYER-BY-LAYER COMPARISON (UNet)")
-
-    for layer_name in ["conv_in", "down_block_0", "mid_block", "final"]:
-        pt_arr = pt_results.get(layer_name)
-        mlx_arr = mlx_results.get(layer_name)
-        if pt_arr is None:
-            print(f"  [{layer_name}] Missing from PT")
+    # --- Compare layer by layer ---
+    separator("LAYER-BY-LAYER COMPARISON")
+    order = ["conv_in", "down_block_0", "mid_block", "up_block_0", "conv_out", "final"]
+    layer_results = {}
+    divergence = None
+    for name in order:
+        pt_arr = pt_results.get(name)
+        mlx_arr = mlx_results.get(name)
+        if pt_arr is None or mlx_arr is None:
+            print(f"  [{name}] missing  (PT={pt_arr is not None}, MLX={mlx_arr is not None})")
             continue
-        if mlx_arr is None:
-            print(f"  [{layer_name}] Missing from MLX")
-            continue
-        compare_tensors(layer_name, pt_arr, mlx_arr)
+        r = compare_tensors(name, pt_arr, mlx_arr)
+        results.append(r)
+        layer_results[name] = r
+        if divergence is None and r.get("status") == "MISMATCH":
+            divergence = name
+
+    del unet_mlx
+    gc.collect()
+
+    return {"layers": layer_results, "divergence": divergence,
+            "pt": pt_results, "mlx": mlx_results}
+
+
+# ---------------------------------------------------------------------------
+# Part 5: Dig into the divergence point
+# ---------------------------------------------------------------------------
+
+def drill_down_first_layer(results: list):
+    """If conv_in already diverges, compare conv_in weights directly.
+
+    Also manually applies the exact PyTorch conv_in via numpy math, and
+    compares both MLX and the reference numpy conv to PyTorch output.
+    This isolates weight-layout vs numerical-op bugs.
+    """
+    separator("PART 5: DRILL-DOWN (CONV_IN ISOLATION)")
+
+    import torch
+    import torch.nn.functional as F
+    import mlx.core as mx
+
+    rng = np.random.RandomState(SEED)
+    sample_nhwc = rng.randn(1, LATENT_H, LATENT_W, IN_CHANNELS).astype(np.float32) * 0.1
+    sample_nchw = nhwc_to_nchw(sample_nhwc)
+
+    unet_pt = load_pt_unet()
+    w_pt = unet_pt.conv_in.weight.detach().cpu().float().numpy()  # (O, I, kH, kW)
+    b_pt = unet_pt.conv_in.bias.detach().cpu().float().numpy()
+
+    # PT reference
+    with torch.no_grad():
+        ref = F.conv2d(torch.tensor(sample_nchw),
+                       torch.tensor(w_pt), torch.tensor(b_pt), padding=1)
+    ref_nhwc = pt_to_nhwc(ref)
+
+    # MLX with weights loaded from safetensors
+    unet_mlx = load_mlx_unet_for_comparison()
+    x_mlx = unet_mlx.conv_in(mx.array(sample_nhwc))
+    mx_sync(x_mlx)
+    mlx_out = np.array(x_mlx)
+
+    # Direct MLX conv with transposed PT weights (sanity check)
+    import mlx.nn as nn
+    conv = nn.Conv2d(IN_CHANNELS, 320, 3, padding=1)
+    conv.weight = mx.array(w_pt.transpose(0, 2, 3, 1))  # (O, kH, kW, I)
+    conv.bias = mx.array(b_pt)
+    direct = conv(mx.array(sample_nhwc))
+    mx_sync(direct)
+    direct_np = np.array(direct)
+
+    # MLX conv_in weight stored
+    mlx_w = np.array(unet_mlx.conv_in.weight)
+    # Compare MLX stored weight with PT transposed weight
+    print("  Weight tensor comparison (MLX stored vs PT transposed to OHWI):")
+    compare_tensors("conv_in.weight", w_pt.transpose(0, 2, 3, 1), mlx_w)
+
+    print("\n  Activation comparisons:")
+    results.append(compare_tensors("conv_in PT-vs-MLX(loaded)", ref_nhwc, mlx_out))
+    results.append(compare_tensors("conv_in PT-vs-MLX(direct weight set)", ref_nhwc, direct_np))
+
+    del unet_pt, unet_mlx
+    gc.collect()
+
+
+# ---------------------------------------------------------------------------
+# Part 6: Drill-down into down_block_0
+# ---------------------------------------------------------------------------
+
+def drill_down_block0(results: list):
+    """Capture PT outputs at resnet-0, attention-0, resnet-1, attention-1,
+    downsample inside down_blocks[0] and compare to MLX step-by-step.
+
+    Also tries a 'corrected timestep' MLX run that uses the PyTorch temb
+    instead of the MLX timestep embedding, to confirm/deny the timestep
+    embedding bug as the root cause of downstream divergence.
+    """
+    separator("PART 6: DRILL-DOWN INTO down_blocks[0]")
+
+    import torch
+    import mlx.core as mx
+    from diffusers.models.embeddings import get_timestep_embedding as pt_get
+
+    rng = np.random.RandomState(SEED)
+    sample_nhwc = rng.randn(1, LATENT_H, LATENT_W, IN_CHANNELS).astype(np.float32) * 0.1
+    text_np = np.zeros((1, TEXT_LEN, CROSS_DIM), dtype=np.float32)
+    timestep_val = 500
+    sample_pt = torch.tensor(nhwc_to_nchw(sample_nhwc))
+
+    # --- PT forward, hooking each sub-module of down_blocks[0] ---
+    unet_pt = load_pt_unet()
+    block = unet_pt.down_blocks[0]
+    captured: dict = {}
+
+    def hook(key):
+        def _h(module, inp, output):
+            if isinstance(output, tuple):
+                output = output[0]
+            captured[key] = output.detach()
+        return _h
+
+    handles = [
+        block.resnets[0].register_forward_hook(hook("resnet0")),
+        block.attentions[0].register_forward_hook(hook("attn0")),
+        block.resnets[1].register_forward_hook(hook("resnet1")),
+        block.attentions[1].register_forward_hook(hook("attn1")),
+    ]
+    if block.downsamplers:
+        handles.append(
+            block.downsamplers[0].register_forward_hook(hook("downsample"))
+        )
+
+    with torch.no_grad():
+        unet_pt(sample_pt, torch.tensor([timestep_val]),
+                encoder_hidden_states=torch.tensor(text_np))
+    for h in handles:
+        h.remove()
+
+    pt_sub = {k: pt_to_nhwc(v) for k, v in captured.items()}
+
+    # Also grab the PT timestep embedding for MLX "corrected" run
+    pt_temb_sinus = pt_get(
+        torch.tensor([timestep_val]).float(), 320,
+        flip_sin_to_cos=True, downscale_freq_shift=0,
+    )
+    pt_emb = unet_pt.time_embedding(pt_temb_sinus).detach().cpu().float().numpy()
+
+    del unet_pt
+    gc.collect()
+
+    # --- MLX forward: standard (buggy timestep) ---
+    unet_mlx = load_mlx_unet_for_comparison()
+    from hunyuanpaintpbr_mlx.unet.blocks_mlx import get_timestep_embedding as mlx_get
+
+    sample_mlx = mx.array(sample_nhwc)
+    text_mlx = mx.array(text_np)
+
+    t_emb = mlx_get(mx.array([timestep_val]), unet_mlx.time_proj_dim)
+    emb_buggy = unet_mlx.time_embedding(t_emb)
+
+    x0 = unet_mlx.conv_in(sample_mlx)
+    b = unet_mlx.down_blocks[0]
+    # Inspect sub-modules individually
+    r0 = b.resnets[0](x0, emb_buggy); mx_sync(r0)
+    a0 = b.attentions[0](r0, text_mlx); mx_sync(a0)
+    r1 = b.resnets[1](a0, emb_buggy); mx_sync(r1)
+    a1 = b.attentions[1](r1, text_mlx); mx_sync(a1)
+
+    mlx_sub = {
+        "resnet0": np.array(r0),
+        "attn0": np.array(a0),
+        "resnet1": np.array(r1),
+        "attn1": np.array(a1),
+    }
+
+    print("  [MLX using its own (buggy?) timestep embedding]")
+    for k in ("resnet0", "attn0", "resnet1", "attn1"):
+        if k in pt_sub and k in mlx_sub:
+            results.append(compare_tensors(f"block0.{k}", pt_sub[k], mlx_sub[k]))
+
+    # --- MLX with pytorch_compatible GroupNorm patched everywhere ---
+    print("\n  [MLX with GroupNorm.pytorch_compatible=True applied to all GNs]")
+    import mlx.nn as mnn
+
+    def patch_gn(module):
+        for _, m in module.named_modules():
+            if isinstance(m, mnn.GroupNorm):
+                m.pytorch_compatible = True
+    patch_gn(unet_mlx)
+
+    x0p = unet_mlx.conv_in(sample_mlx)
+    r0p = b.resnets[0](x0p, emb_buggy); mx_sync(r0p)
+    a0p = b.attentions[0](r0p, text_mlx); mx_sync(a0p)
+    r1p = b.resnets[1](a0p, emb_buggy); mx_sync(r1p)
+    a1p = b.attentions[1](r1p, text_mlx); mx_sync(a1p)
+    for k, arr in [("resnet0", r0p), ("attn0", a0p),
+                   ("resnet1", r1p), ("attn1", a1p)]:
+        results.append(compare_tensors(
+            f"block0.{k} (GN fix)", pt_sub[k], np.array(arr)))
+
+    # Undo patch for the next experiment
+    def unpatch_gn(module):
+        for _, m in module.named_modules():
+            if isinstance(m, mnn.GroupNorm):
+                m.pytorch_compatible = False
+    unpatch_gn(unet_mlx)
+
+    # --- MLX forward: use PyTorch's temb instead ---
+    print("\n  [MLX using PyTorch's timestep embedding]")
+    emb_fixed = mx.array(pt_emb)
+    r0f = b.resnets[0](x0, emb_fixed); mx_sync(r0f)
+    a0f = b.attentions[0](r0f, text_mlx); mx_sync(a0f)
+    r1f = b.resnets[1](a0f, emb_fixed); mx_sync(r1f)
+    a1f = b.attentions[1](r1f, text_mlx); mx_sync(a1f)
+
+    for k, arr in [("resnet0", r0f), ("attn0", a0f),
+                   ("resnet1", r1f), ("attn1", a1f)]:
+        if k in pt_sub:
+            results.append(compare_tensors(
+                f"block0.{k} (PT temb)", pt_sub[k], np.array(arr)))
 
     del unet_mlx
     gc.collect()
 
 
-# ============================================================================
-# Part 5: VAE Comparison
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Write markdown report
+# ---------------------------------------------------------------------------
 
-def compare_vae():
-    separator("VAE COMPARISON")
-
-    import torch
-    from diffusers import AutoencoderKL
-    import mlx.core as mx
-    from mlx.utils import tree_flatten
-
-    from hunyuanpaintpbr_mlx.vae_mlx import AutoencoderKLMLX
-
-    # Create deterministic test image
-    rng = np.random.RandomState(SEED)
-    # Small image: 64x64x3 in [-1, 1]
-    img_np = rng.randn(1, 64, 64, 3).astype(np.float32) * 0.5
-
-    # --- PyTorch VAE ---
-    print("Loading PyTorch VAE...")
-    vae_pt = AutoencoderKL.from_pretrained(PT_VAE_DIR, torch_dtype=torch.float32)
-    vae_pt.eval()
-
-    img_pt = torch.tensor(nhwc_to_nchw(img_np))
-
-    print("Running PyTorch VAE encode...")
-    with torch.no_grad():
-        posterior = vae_pt.encode(img_pt)
-        latent_pt = posterior.latent_dist.mean * vae_pt.config.scaling_factor
-        latent_pt_np = pt_to_nhwc(latent_pt)
-
-    print(f"  PT latent shape: {latent_pt_np.shape}")
-    print(f"  PT latent stats: min={latent_pt_np.min():.4f} max={latent_pt_np.max():.4f}")
-
-    # Decode
-    with torch.no_grad():
-        decoded_pt = vae_pt.decode(latent_pt / vae_pt.config.scaling_factor).sample
-        decoded_pt_np = pt_to_nhwc(decoded_pt)
-
-    # Spot-check VAE weights before freeing PT model
-    pt_sd = vae_pt.state_dict()
-
-    del vae_pt, img_pt, latent_pt, decoded_pt
-    gc.collect()
-    if torch.backends.mps.is_available():
-        torch.mps.empty_cache()
-
-    # --- MLX VAE ---
-    print("\nLoading MLX VAE...")
-    vae_mlx = AutoencoderKLMLX()
-
-    vae_w = dict(mx.load(os.path.join(MLX_WEIGHTS_DIR, "paint_vae.safetensors")))
-    vae_mlx.load_weights(list(vae_w.items()))
-
-    # Cast to float32
-    float32_params = [(k, v.astype(mx.float32)) for k, v in tree_flatten(vae_mlx.parameters())]
-    vae_mlx.load_weights(float32_params)
-    del float32_params
-
-    img_mlx = mx.array(img_np)
-
-    print("Running MLX VAE encode...")
-    latent_mlx = vae_mlx.encode(img_mlx)
-    mx_sync(latent_mlx)
-    latent_mlx_np = np.array(latent_mlx)
-
-    print(f"  MLX latent shape: {latent_mlx_np.shape}")
-    print(f"  MLX latent stats: min={latent_mlx_np.min():.4f} max={latent_mlx_np.max():.4f}")
-
-    # Decode
-    decoded_mlx = vae_mlx.decode(latent_mlx)
-    mx_sync(decoded_mlx)
-    decoded_mlx_np = np.array(decoded_mlx)
-
-    # --- Compare ---
-    separator("VAE ENCODE/DECODE COMPARISON")
-    compare_tensors("vae_encode_latent", latent_pt_np, latent_mlx_np)
-    compare_tensors("vae_decode_image", decoded_pt_np, decoded_mlx_np)
-
-    # Also compare VAE weights directly
-    print("\n  VAE weight spot-check:")
-
-    vae_weight_keys = [
-        "encoder.conv_in.weight",
-        "encoder.down_blocks.0.resnets.0.conv1.weight",
-        "decoder.conv_in.weight",
+def write_report(results: list, forward_summary: dict, path: str):
+    lines = [
+        "# MLX vs PyTorch Numerical Comparison Report",
+        "",
+        f"- latent size: {LATENT_H}x{LATENT_W}",
+        f"- in_channels: {IN_CHANNELS}",
+        f"- tolerance: {TOL}",
+        "",
+        "## Layer-by-layer divergence",
+        "",
     ]
+    layers = forward_summary.get("layers", {}) if forward_summary else {}
+    if layers:
+        lines += [
+            "| layer | status | max_abs | max_rel | mean_abs | pt_norm | mlx_norm |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for name, r in layers.items():
+            lines.append(
+                f"| {name} | {r.get('status','?')} | "
+                f"{r.get('max_abs',float('nan')):.3e} | "
+                f"{r.get('max_rel',float('nan')):.3e} | "
+                f"{r.get('mean_abs',float('nan')):.3e} | "
+                f"{r.get('pt_norm',float('nan')):.3f} | "
+                f"{r.get('mlx_norm',float('nan')):.3f} |"
+            )
+        div = forward_summary.get("divergence")
+        lines += ["", f"**First divergent layer:** {div or 'none — all layers MATCH'}", ""]
 
-    for key in vae_weight_keys:
-        if key in pt_sd and key in vae_w:
-            pt_w = pt_sd[key].detach().cpu().float().numpy()
-            mlx_w = np.array(vae_w[key].astype(mx.float32))
-            if pt_w.ndim == 4:
-                pt_w = pt_w.transpose(0, 2, 3, 1)
-            compare_tensors(f"vae_weight:{key}", pt_w, mlx_w)
+    lines += ["## All comparisons", "",
+              "| comparison | status | max_abs | max_rel |",
+              "| --- | --- | --- | --- |"]
+    for r in results:
+        if "status" not in r:
+            continue
+        lines.append(
+            f"| {r['name']} | {r['status']} | "
+            f"{r.get('max_abs', float('nan')):.3e} | "
+            f"{r.get('max_rel', float('nan')):.3e} |"
+        )
 
-    del pt_sd, vae_w, vae_mlx
-    gc.collect()
-
-
-# ============================================================================
-# Utility
-# ============================================================================
-
-def mx_sync(x):
-    """Force MLX to materialize a lazy array."""
-    import mlx.core as mx
-    mx.eval(x)
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"\nReport written to {path}")
 
 
-# ============================================================================
+# ---------------------------------------------------------------------------
 # Main
-# ============================================================================
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("  MLX vs PyTorch UNet/VAE Numerical Comparison")
-    print("  Latent size: {}x{} (tiny for debugging)".format(LATENT_H, LATENT_W))
+    print("  MLX vs PyTorch UNet Numerical Comparison")
+    print(f"  Latent size: {LATENT_H}x{LATENT_W}  in_channels={IN_CHANNELS}")
     print("=" * 70)
 
-    # Run all comparisons
+    results: list = []
+    forward_summary: dict = {}
+
     sections = [
-        ("Weight Comparison", compare_weights),
-        ("Attention Head Dim Analysis", check_attention_head_dims),
-        ("Timestep Embedding", compare_timestep_embedding_detail),
-        ("UNet Forward Pass", compare_unet_forward),
-        ("VAE Comparison", compare_vae),
+        ("Weight spot check", lambda: compare_weights(results)),
+        ("Attention head dims", check_attention_head_dims),
+        ("Timestep embedding", lambda: compare_timestep_embedding_detail(results)),
+        ("UNet forward pass",
+         lambda: forward_summary.update(compare_unet_forward(results) or {})),
+        ("Conv_in drill down", lambda: drill_down_first_layer(results)),
+        ("down_block_0 drill down", lambda: drill_down_block0(results)),
     ]
 
     for name, func in sections:
@@ -644,12 +764,11 @@ if __name__ == "__main__":
             traceback.print_exc()
 
     separator("SUMMARY")
-    print("  Check the output above for [FAIL] markers.")
-    print("  Key things that could cause blue/cyan blob textures:")
-    print("  1. attention_head_dim mismatch (PT uses per-block [5,10,20,20], MLX uses fixed 8)")
-    print("  2. sin/cos ordering in timestep embedding")
-    print("  3. Conv weight transposition errors")
-    print("  4. Linear weight transposition (PT vs MLX convention)")
-    print("  5. VAE encode/decode mismatch")
-    print("  6. GroupNorm epsilon differences")
-    print()
+    print(f"  First divergent layer: "
+          f"{forward_summary.get('divergence') or 'none'}")
+
+    report_path = os.path.join(os.path.dirname(__file__), "comparison_report_auto.md")
+    try:
+        write_report(results, forward_summary, report_path)
+    except Exception as e:
+        print(f"  Failed to write report: {e}")

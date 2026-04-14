@@ -65,7 +65,7 @@ class Hunyuan3DPaintConfigMLX:
         # downloaded via huggingface_hub) or an absolute local path. The
         # env var HUNYUAN3D_MLX_WEIGHTS_DIR overrides this value.
         self.use_mlx_diffusion = True
-        self.mlx_weights_source = "dgrauet/hunyuan3d-2.1-mlx-mlx"
+        self.mlx_weights_source = "dgrauet/hunyuan3d-2.1-mlx"
         self.mlx_num_inference_steps = 15
         self.mlx_guidance_scale = 3.0
         self.mlx_seed = 42

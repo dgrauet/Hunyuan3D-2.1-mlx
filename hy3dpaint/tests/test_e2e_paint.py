@@ -24,7 +24,7 @@ MESH_PATH = os.path.join(
 REF_IMAGE_PATH = "/tmp/full/ComfyUI_temp_cpzbr_00007_.png"
 # HF repo ID (auto-downloaded via huggingface_hub) or local path override
 # via HUNYUAN3D_MLX_WEIGHTS_DIR env var.
-WEIGHTS_SOURCE = "dgrauet/hunyuan3d-2.1-mlx-mlx"
+WEIGHTS_SOURCE = "dgrauet/hunyuan3d-2.1-mlx"
 OUT_DIR = "/tmp/full/e2e_fixed"
 
 VIEW_SIZE = 512

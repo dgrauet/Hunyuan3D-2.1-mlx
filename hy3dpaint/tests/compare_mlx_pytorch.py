@@ -39,7 +39,7 @@ if _env_mlx:
 else:
     from huggingface_hub import snapshot_download
     MLX_WEIGHTS_DIR = snapshot_download(
-        repo_id="dgrauet/hunyuan3d-2.1-mlx-mlx",
+        repo_id="dgrauet/hunyuan3d-2.1-mlx",
         allow_patterns=[
             "paint_unet.safetensors",
             "paint_vae.safetensors",

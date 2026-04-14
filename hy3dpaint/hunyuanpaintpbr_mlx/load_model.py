@@ -221,7 +221,7 @@ class HunyuanPaintModelMLX:
 
     @staticmethod
     def from_pretrained(
-        weights_source: str = "dgrauet/hunyuan3d-2.1-mlx-mlx",
+        weights_source: str = "dgrauet/hunyuan3d-2.1-mlx",
     ) -> "HunyuanPaintModelMLX":
         """Load all components from converted weights.
 

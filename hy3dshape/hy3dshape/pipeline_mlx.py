@@ -6,6 +6,7 @@ Orchestrates: DINOv2 encoding -> DiT denoising -> ShapeVAE decoding -> marching 
 
 import gc
 import json
+import os
 from pathlib import Path
 from typing import Optional, Union
 
@@ -185,23 +186,43 @@ class ShapePipeline:
         return mesh
 
     @classmethod
-    def from_pretrained(cls, model_dir: str) -> "ShapePipeline":
-        """Load all components from a directory of safetensors weights.
-
-        Expected directory structure:
-            model_dir/
-                config.json           - Full pipeline config
-                image_encoder.safetensors
-                dit.safetensors
-                vae.safetensors
+    def from_pretrained(
+        cls,
+        weights_source: str = "dgrauet/hunyuan3d-2.1-mlx",
+    ) -> "ShapePipeline":
+        """Load all components from converted weights.
 
         Args:
-            model_dir: Path to model directory.
+            weights_source: Either a HuggingFace repo ID (auto-downloaded via
+                ``huggingface_hub.snapshot_download`` and cached locally) or an
+                absolute path to a directory with ``config.json``,
+                ``image_encoder.safetensors``, ``dit.safetensors``,
+                ``vae.safetensors``.
+
+        Environment:
+            HUNYUAN3D_MLX_WEIGHTS_DIR — overrides ``weights_source`` if set.
 
         Returns:
             Loaded ShapePipeline.
         """
-        model_dir = Path(model_dir)
+        env_override = os.environ.get("HUNYUAN3D_MLX_WEIGHTS_DIR")
+        if env_override:
+            weights_source = env_override
+
+        if os.path.isdir(weights_source):
+            model_dir = Path(weights_source)
+        else:
+            from huggingface_hub import snapshot_download
+            model_dir = Path(snapshot_download(
+                repo_id=weights_source,
+                allow_patterns=[
+                    "config.json",
+                    "split_model.json",
+                    "image_encoder.safetensors",
+                    "dit.safetensors",
+                    "vae.safetensors",
+                ],
+            ))
 
         # Load config
         config_path = model_dir / "config.json"

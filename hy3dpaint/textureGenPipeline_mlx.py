@@ -15,10 +15,34 @@ from PIL import Image
 from typing import List
 
 from DifferentiableRenderer.mesh_render_mlx import MeshRenderMLX
-from DifferentiableRenderer.mesh_utils import convert_obj_to_glb
 from utils.pipeline_utils_mlx import ViewProcessorMLX
-from utils.simplify_mesh_utils import remesh_mesh
-from utils.uvwrap_utils import mesh_uv_wrap
+
+
+def _convert_obj_to_glb(obj_path: str, glb_path: str) -> bool:
+    """Convert OBJ + MTL + textures to GLB.
+
+    Tries Blender (mesh_utils.convert_obj_to_glb) first for highest fidelity,
+    falls back to trimesh (pure Python, no CUDA/Blender dependency) so the
+    pipeline runs on Apple Silicon without `bpy`.
+    """
+    try:
+        from DifferentiableRenderer.mesh_utils import convert_obj_to_glb
+        return convert_obj_to_glb(obj_path, glb_path)
+    except ImportError:
+        pass
+
+    import trimesh
+    mesh = trimesh.load(obj_path, process=False)
+    mesh.export(glb_path)
+    return os.path.exists(glb_path)
+try:
+    from utils.simplify_mesh_utils import remesh_mesh
+except ImportError:
+    remesh_mesh = None  # pymeshlab unavailable; require use_remesh=False
+try:
+    from utils.uvwrap_utils import mesh_uv_wrap
+except ImportError:
+    mesh_uv_wrap = None  # xatlas unavailable; require pre-wrapped mesh
 
 warnings.filterwarnings("ignore")
 
@@ -32,6 +56,19 @@ class Hunyuan3DPaintConfigMLX:
         self.multiview_pretrained_path = "tencent/Hunyuan3D-2.1"
         self.dino_ckpt_path = "facebook/dinov2-giant"
         self.realesrgan_ckpt_path = "ckpt/RealESRGAN_x4plus.pth"
+
+        # Fully-MLX diffusion (Apple Silicon, no CUDA).
+        # When True, loads HunyuanPaintModelMLX from mlx_weights_source and
+        # skips the PyTorch multiview model / super-resolution.
+        #
+        # mlx_weights_source may be either a HuggingFace repo ID (auto-
+        # downloaded via huggingface_hub) or an absolute local path. The
+        # env var HUNYUAN3D_MLX_WEIGHTS_DIR overrides this value.
+        self.use_mlx_diffusion = True
+        self.mlx_weights_source = "dgrauet/hunyuan3d-2.1-mlx-mlx"
+        self.mlx_num_inference_steps = 15
+        self.mlx_guidance_scale = 3.0
+        self.mlx_seed = 42
 
         self.raster_mode = "mlx"
         self.bake_mode = "back_sample"
@@ -79,7 +116,19 @@ class Hunyuan3DPaintPipelineMLX:
         self.load_models()
 
     def load_models(self):
-        """Load PyTorch ML models (diffusion + super-res)."""
+        """Load diffusion model.
+
+        MLX path: HunyuanPaintModelMLX on Apple Silicon.
+        PyTorch path: diffusion + super-res on CUDA (legacy).
+        """
+        if self.config.use_mlx_diffusion:
+            from hunyuanpaintpbr_mlx.load_model import HunyuanPaintModelMLX
+            self.models["mlx_model"] = HunyuanPaintModelMLX.from_pretrained(
+                self.config.mlx_weights_source,
+            )
+            print("MLX diffusion model loaded.")
+            return
+
         try:
             import torch
             torch.cuda.empty_cache()
@@ -91,6 +140,48 @@ class Hunyuan3DPaintPipelineMLX:
         except (ImportError, RuntimeError) as e:
             print(f"ML models not loaded ({e}). "
                   "Pipeline can still run render/bake with pre-generated images.")
+
+    def _run_multiview_mlx(self, image_style, normal_maps, position_maps,
+                            camera_azims):
+        """Run MLX multiview diffusion.
+
+        Args:
+            image_style: list of PIL reference images (we use only the first).
+            normal_maps: list of PIL normal maps (one per view).
+            position_maps: list of PIL position maps.
+            camera_azims: list of azimuth angles.
+
+        Returns:
+            dict with 'albedo' and 'mr', each a list of PIL images.
+        """
+        from hunyuanpaintpbr_mlx.inference import generate_multiview_pbr
+
+        ref_np = np.array(image_style[0].convert("RGB"))
+
+        def _pil_to_np_f32(img):
+            """Convert a PIL image to (H, W, 3) float32 in [0, 1]."""
+            arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
+            return arr
+
+        n_maps = [_pil_to_np_f32(m) for m in normal_maps]
+        p_maps = [_pil_to_np_f32(m) for m in position_maps]
+
+        result = generate_multiview_pbr(
+            model=self.models["mlx_model"],
+            normal_maps=n_maps,
+            position_maps=p_maps,
+            reference_image=ref_np,
+            camera_azims=camera_azims,
+            num_inference_steps=self.config.mlx_num_inference_steps,
+            guidance_scale=self.config.mlx_guidance_scale,
+            view_size=self.config.resolution,
+            seed=self.config.mlx_seed,
+        )
+
+        return {
+            "albedo": [Image.fromarray(a) for a in result["albedo"]],
+            "mr": [Image.fromarray(m) for m in result["mr"]],
+        }
 
     def __call__(self, mesh_path=None, image_path=None,
                  output_mesh_path=None, use_remesh=True, save_glb=True):
@@ -129,7 +220,19 @@ class Hunyuan3DPaintPipelineMLX:
             output_mesh_path = os.path.join(path, "textured_mesh.obj")
 
         mesh = trimesh.load(processed_mesh_path)
-        mesh = mesh_uv_wrap(mesh)
+        # Only UV-wrap if the mesh lacks UVs or xatlas is forced
+        needs_wrap = True
+        if isinstance(mesh, trimesh.Trimesh):
+            uv = getattr(getattr(mesh, "visual", None), "uv", None)
+            if uv is not None and len(uv) > 0:
+                needs_wrap = False
+        if needs_wrap:
+            if mesh_uv_wrap is None:
+                raise RuntimeError(
+                    "Mesh has no UVs and `xatlas` is not installed. "
+                    "Install xatlas or provide a pre-wrapped mesh."
+                )
+            mesh = mesh_uv_wrap(mesh)
         self.render.load_mesh(mesh=mesh)
 
         # --- View selection ---
@@ -159,35 +262,42 @@ class Hunyuan3DPaintPipelineMLX:
                 image = white_bg
             image_style.append(image.convert("RGB"))
 
-        # --- Multiview diffusion (PyTorch, CUDA GPU) ---
-        if "multiview_model" not in self.models:
-            raise RuntimeError(
-                "Multiview diffusion model not loaded. "
-                "Install PyTorch with CUDA support."
+        # --- Multiview diffusion ---
+        if self.config.use_mlx_diffusion:
+            multiviews_pbr = self._run_multiview_mlx(
+                image_style, normal_maps, position_maps, selected_azims,
+            )
+            enhance_images = {
+                "albedo": list(multiviews_pbr["albedo"]),
+                "mr": list(multiviews_pbr["mr"]),
+            }
+        else:
+            if "multiview_model" not in self.models:
+                raise RuntimeError(
+                    "Multiview diffusion model not loaded. "
+                    "Install PyTorch with CUDA support."
+                )
+            multiviews_pbr = self.models["multiview_model"](
+                image_style,
+                normal_maps + position_maps,
+                prompt="high quality",
+                custom_view_size=self.config.resolution,
+                resize_input=True,
             )
 
-        multiviews_pbr = self.models["multiview_model"](
-            image_style,
-            normal_maps + position_maps,
-            prompt="high quality",
-            custom_view_size=self.config.resolution,
-            resize_input=True,
-        )
-
-        # --- Super-resolution (PyTorch, CUDA GPU) ---
-        enhance_images = {
-            "albedo": copy.deepcopy(multiviews_pbr["albedo"]),
-            "mr": copy.deepcopy(multiviews_pbr["mr"]),
-        }
-
-        if "super_model" in self.models:
-            for i in range(len(enhance_images["albedo"])):
-                enhance_images["albedo"][i] = self.models["super_model"](
-                    enhance_images["albedo"][i]
-                )
-                enhance_images["mr"][i] = self.models["super_model"](
-                    enhance_images["mr"][i]
-                )
+            # Super-resolution (CUDA-only)
+            enhance_images = {
+                "albedo": copy.deepcopy(multiviews_pbr["albedo"]),
+                "mr": copy.deepcopy(multiviews_pbr["mr"]),
+            }
+            if "super_model" in self.models:
+                for i in range(len(enhance_images["albedo"])):
+                    enhance_images["albedo"][i] = self.models["super_model"](
+                        enhance_images["albedo"][i]
+                    )
+                    enhance_images["mr"][i] = self.models["super_model"](
+                        enhance_images["mr"][i]
+                    )
 
         # --- Texture baking (MLX, Metal GPU) ---
         render_size = self.config.render_size
@@ -226,6 +336,6 @@ class Hunyuan3DPaintPipelineMLX:
 
         if save_glb:
             glb_path = output_mesh_path.replace(".obj", ".glb")
-            convert_obj_to_glb(output_mesh_path, glb_path)
+            _convert_obj_to_glb(output_mesh_path, glb_path)
 
         return output_mesh_path

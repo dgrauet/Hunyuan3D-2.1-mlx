@@ -20,9 +20,32 @@ import gc
 # Paths
 # ---------------------------------------------------------------------------
 
-PT_UNET_DIR = "/Users/dgrauet/Work/mlx-forge/downloads/hunyuan3d-2.1/hunyuan3d-paintpbr-v2-1/unet/"
-PT_VAE_DIR = "/Users/dgrauet/Work/mlx-forge/downloads/hunyuan3d-2.1/hunyuan3d-paintpbr-v2-1/vae/"
-MLX_WEIGHTS_DIR = "/Users/dgrauet/Work/mlx-forge/models/hunyuan3d-2.1-mlx"
+# PyTorch source weights for ground-truth comparison. Override via env var
+# or pass --pt-weights on CLI if you keep them elsewhere.
+PT_WEIGHTS_ROOT = os.environ.get(
+    "HUNYUAN3D_PT_WEIGHTS_ROOT",
+    os.path.expanduser(
+        "~/Work/mlx-forge/downloads/hunyuan3d-2.1/hunyuan3d-paintpbr-v2-1"
+    ),
+)
+PT_UNET_DIR = os.path.join(PT_WEIGHTS_ROOT, "unet")
+PT_VAE_DIR = os.path.join(PT_WEIGHTS_ROOT, "vae")
+
+# MLX weights: resolve HF repo ID (cached under ~/.cache/huggingface/hub).
+# Override with HUNYUAN3D_MLX_WEIGHTS_DIR to use a local checkout.
+_env_mlx = os.environ.get("HUNYUAN3D_MLX_WEIGHTS_DIR")
+if _env_mlx:
+    MLX_WEIGHTS_DIR = _env_mlx
+else:
+    from huggingface_hub import snapshot_download
+    MLX_WEIGHTS_DIR = snapshot_download(
+        repo_id="dgrauet/hunyuan3d-2.1-mlx-mlx",
+        allow_patterns=[
+            "paint_unet.safetensors",
+            "paint_vae.safetensors",
+            "paint_dino.safetensors",
+        ],
+    )
 
 # Latent size (small so both models fit comfortably)
 LATENT_H, LATENT_W = 8, 8

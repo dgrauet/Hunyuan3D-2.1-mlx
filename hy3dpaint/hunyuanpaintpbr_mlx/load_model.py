@@ -4,6 +4,7 @@ Handles the full weight loading including 2.5D attention modules
 that get dynamically attached to transformer blocks.
 """
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -219,14 +220,40 @@ class HunyuanPaintModelMLX:
         self.cross_attention_dim = cross_attention_dim
 
     @staticmethod
-    def from_pretrained(weights_dir: str) -> "HunyuanPaintModelMLX":
-        """Load all components from converted weights directory.
+    def from_pretrained(
+        weights_source: str = "dgrauet/hunyuan3d-2.1-mlx-mlx",
+    ) -> "HunyuanPaintModelMLX":
+        """Load all components from converted weights.
 
         Args:
-            weights_dir: Path to directory with paint_unet.safetensors,
-                         paint_vae.safetensors, paint_dino.safetensors.
+            weights_source: Either a HuggingFace repo ID (e.g.
+                ``dgrauet/hunyuan3d-2.1-mlx``) which will be downloaded
+                via ``huggingface_hub.snapshot_download`` and cached
+                locally, or an absolute path to a local directory
+                containing ``paint_{unet,vae,dino}.safetensors``.
+
+        Environment:
+            HUNYUAN3D_MLX_WEIGHTS_DIR — overrides ``weights_source`` if set.
         """
-        weights_dir = Path(weights_dir)
+        env_override = os.environ.get("HUNYUAN3D_MLX_WEIGHTS_DIR")
+        if env_override:
+            weights_source = env_override
+
+        if os.path.isdir(weights_source):
+            weights_dir = Path(weights_source)
+        else:
+            # Treat as HF repo ID. Only fetch the paint_* files we need.
+            from huggingface_hub import snapshot_download
+            weights_dir = Path(snapshot_download(
+                repo_id=weights_source,
+                allow_patterns=[
+                    "paint_unet.safetensors",
+                    "paint_vae.safetensors",
+                    "paint_dino.safetensors",
+                    "config.json",
+                    "split_model.json",
+                ],
+            ))
 
         # --- VAE ---
         print("Loading VAE...")

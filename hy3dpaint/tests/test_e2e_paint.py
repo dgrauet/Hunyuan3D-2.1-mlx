@@ -22,7 +22,9 @@ MESH_PATH = os.path.join(
     os.path.dirname(__file__), "..", "assets", "case_2", "mesh.glb"
 )
 REF_IMAGE_PATH = "/tmp/full/ComfyUI_temp_cpzbr_00007_.png"
-WEIGHTS_DIR = "/Users/dgrauet/Work/mlx-forge/models/hunyuan3d-2.1-mlx"
+# HF repo ID (auto-downloaded via huggingface_hub) or local path override
+# via HUNYUAN3D_MLX_WEIGHTS_DIR env var.
+WEIGHTS_SOURCE = "dgrauet/hunyuan3d-2.1-mlx-mlx"
 OUT_DIR = "/tmp/full/e2e_fixed"
 
 VIEW_SIZE = 512
@@ -68,7 +70,7 @@ def main() -> None:
     from hunyuanpaintpbr_mlx.load_model import HunyuanPaintModelMLX
 
     t0 = time.time()
-    model = HunyuanPaintModelMLX.from_pretrained(WEIGHTS_DIR)
+    model = HunyuanPaintModelMLX.from_pretrained(WEIGHTS_SOURCE)
     print(f"      loaded in {time.time() - t0:.1f}s")
 
     # --- Generate ---

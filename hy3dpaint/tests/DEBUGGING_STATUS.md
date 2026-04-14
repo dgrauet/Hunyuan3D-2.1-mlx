@@ -1,4 +1,4 @@
-# MLX vs PyTorch Numerical Validation - Debug Status
+# MLX vs PyTorch Numerical Validation - RESOLVED
 
 ## Current state
 
@@ -8,58 +8,65 @@
 | Conv layers | 0 | ✅ MATCH |
 | GroupNorm | 7e-7 | ✅ MATCH (with pytorch_compatible=True) |
 | Timestep embedding | 3e-5 | ✅ MATCH |
-| ResNet block (in-UNet) | 1.1e-5 | ✅ MATCH |
-| BasicTransformerBlock (standalone, same weights) | 0 | ✅ MATCH |
-| Transformer2DModel (standalone, same weights) | 1e-5 | ✅ MATCH |
-| Full UNet forward (PT vs MLX, same input) | **0.20** | ⚠ MISMATCH |
+| ResNet block | 1e-5 | ✅ MATCH |
+| Self-attention (attn0) | 6.8e-5 | ✅ MATCH |
+| down_block_0 full | 1.6e-4 | ✅ MATCH |
+| mid_block | 3.6e-4 | ✅ MATCH |
+| up_block_0 | 1.7e-4 | ✅ MATCH |
+| **Full UNet final** | **1.17e-5** | **✅ MATCH** |
 
-## Key insight
+## Root cause (identified and fixed)
 
-Each individual building block matches PyTorch perfectly when tested in isolation.
-The Transformer2DModel standalone test produces **identical** output to PyTorch
-diffusers `Transformer2DModel` (max_diff 1e-5).
+**Diffusers `attention_head_dim` config is a misnomer — it specifies `num_heads`, not per-head dim.**
 
-But the full UNet forward pass shows ~0.20 max_abs error (~3% norm).
+For SD 2.1 paint UNet, `attention_head_dim=[5, 10, 20, 20]` with
+`block_out_channels=[320, 640, 1280, 1280]` means:
+- 5 heads × 64 dim (block 0)
+- 10 heads × 64 dim (block 1)
+- 20 heads × 64 dim (blocks 2–3)
 
-This means the error accumulates through the chain of layers (~24 transformer blocks
-+ resnet blocks). Each layer's output is slightly off, and the next layer takes
-that slightly-off input and produces a slightly-more-off output.
+The MLX port originally interpreted the values as per-head dim and computed
+`num_heads = channels // head_dim`, giving 64 heads × 5 dim per block —
+the *opposite* of what diffusers does.
 
-## Why the cyan/neutral output?
+Because `inner_dim = num_heads × head_dim = channels` either way, weight
+tensors load at the correct shape. The bug only manifests at runtime when
+Q/K/V are reshaped for multi-head attention: `softmax(QK^T/√d)` operates
+on a completely different grouping, producing numerically different outputs.
 
-3% error per UNet pass × 15 denoising steps × CFG amplification → cumulative
-divergence pushes the final latent toward a "neutral" value. The VAE decodes
-this neutral latent to cyan/white.
+### Symptom chain
+1. Single attention layer diverges by ~0.5 max_abs
+2. ResNet after attn inherits the error, amplifies it (0.56)
+3. Full UNet: 0.21 max_abs, ~3% relative norm error per pass
+4. 15 denoising steps × CFG cumulative divergence → latents drift toward a
+   neutral value
+5. VAE decodes neutral latent to cyan/white blobs instead of textures
 
-## Likely causes (not yet identified)
+## Fix
 
-1. **Subtle softmax precision**: fp16 weights cast to fp32, but intermediate
-   activations might lose precision differently
-2. **MLX vs PyTorch attention scaling**: minor float differences in how
-   `softmax(QK^T / sqrt(d))` is computed
-3. **FFN GEGLU implementation**: our GEGLU might compute `silu(gate) * value`
-   while PyTorch does `gate * gelu(value)` (or similar order)
-4. **Weight precision loss**: fp16 → fp32 cast doesn't recover lost precision
+Three one-line changes in `hunyuanpaintpbr_mlx/unet/unet_mlx.py`:
 
-## Reproducing the issue
+- Down blocks: `num_heads = self._attention_head_dims[i]`
+  (was `ch // self._attention_head_dims[i]`)
+- Mid block: `num_mid_heads = self._attention_head_dims[-1]`
+  (was `mid_channels // self._attention_head_dims[-1]`)
+- Up blocks: `num_heads = self._attention_head_dims[rev_idx]`
+  (was `ch // self._attention_head_dims[rev_idx]`)
+
+## Validation
 
 ```bash
 cd /Users/dgrauet/Work/Hunyuan3D-2.1-mlx/hy3dpaint
 python3 tests/compare_mlx_pytorch.py
 ```
 
-Look for `[final]` line — should show `max_abs ~0.21`.
+Final line should show `[final] max_abs=1.17e-05 [MATCH]`. All six layers
+(conv_in, down_block_0, mid_block, up_block_0, conv_out, final) match.
 
-## Next steps for full quality
+## Next steps
 
-1. **Reduce per-layer error**: profile the FIRST CrossAttnDownBlock2D end-to-end
-   PT vs MLX to see if 3-resnet+2-attention chain accumulates beyond what
-   individual layer testing shows.
-
-2. **Compare attention internals**: instrument attention to capture Q, K, V,
-   QK^T, softmax, attention output. Compare each step PT vs MLX.
-
-3. **Check FeedForward GEGLU**: Verify the order of operations matches diffusers.
-
-4. **Try fp16 throughout**: PyTorch SD2.1 inference is typically fp16. Forcing
-   fp32 might amplify some numerical paths.
+1. Run end-to-end paint inference with the real mermaid mesh + astronaut
+   texture and confirm textures are now coherent (not cyan/white).
+2. If textures appear but quality lags, investigate remaining 2.5D paths
+   (MDA, reference, multiview, DINO) — these were disabled in the above
+   plain-UNet validation but re-engaged during actual inference.

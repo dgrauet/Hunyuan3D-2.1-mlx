@@ -71,8 +71,9 @@ class UNet2DConditionModelMLX(nn.Module):
             output_channel = ch
 
             if i < len(block_out_channels) - 1:
-                head_dim = self._attention_head_dims[i]
-                num_heads = ch // head_dim
+                # Diffusers convention: attention_head_dim is actually num_heads.
+                # The true per-head dim is ch // num_heads.
+                num_heads = self._attention_head_dims[i]
                 self.down_blocks.append(
                     CrossAttnDownBlock2D(
                         in_channels=input_channel,
@@ -99,7 +100,7 @@ class UNet2DConditionModelMLX(nn.Module):
 
         # Mid block
         mid_channels = block_out_channels[-1]
-        num_mid_heads = mid_channels // self._attention_head_dims[-1]
+        num_mid_heads = self._attention_head_dims[-1]
         self.mid_block = UNetMidBlock2DCrossAttn(
             in_channels=mid_channels,
             temb_channels=time_embed_dim,
@@ -119,10 +120,10 @@ class UNet2DConditionModelMLX(nn.Module):
             input_channel = reversed_channels[min(i + 1, len(reversed_channels) - 1)]
 
             if i > 0:
-                # CrossAttn — use reversed head_dim to match down blocks
+                # CrossAttn — use reversed num_heads to match down blocks.
+                # Diffusers convention: attention_head_dim == num_heads.
                 rev_idx = len(block_out_channels) - 1 - i
-                head_dim = self._attention_head_dims[max(rev_idx, 0)]
-                num_heads = ch // head_dim
+                num_heads = self._attention_head_dims[max(rev_idx, 0)]
                 self.up_blocks.append(
                     CrossAttnUpBlock2D(
                         in_channels=input_channel,

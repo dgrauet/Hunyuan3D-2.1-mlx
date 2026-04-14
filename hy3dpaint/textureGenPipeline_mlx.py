@@ -70,6 +70,12 @@ class Hunyuan3DPaintConfigMLX:
         self.mlx_guidance_scale = 3.0
         self.mlx_seed = 42
 
+        # Fully-MLX super-resolution (RealESRGAN x4, ~17M params).
+        # Upscales each 512^2 generated view to 2048^2 before baking so
+        # the UV atlas keeps detail. Disable for faster iteration.
+        self.use_mlx_super_res = True
+        self.mlx_super_res_filename = "realesrgan_x4plus.safetensors"
+
         self.raster_mode = "mlx"
         self.bake_mode = "back_sample"
         self.render_size = 1024 * 2
@@ -127,6 +133,12 @@ class Hunyuan3DPaintPipelineMLX:
                 self.config.mlx_weights_source,
             )
             print("MLX diffusion model loaded.")
+
+            if getattr(self.config, "use_mlx_super_res", False):
+                from utils.image_super_utils_mlx import imageSuperNetMLX
+                sr_path = self._resolve_super_res_weights()
+                self.models["mlx_super"] = imageSuperNetMLX(sr_path)
+                print(f"MLX super-resolution loaded ({sr_path}).")
             return
 
         try:
@@ -140,6 +152,22 @@ class Hunyuan3DPaintPipelineMLX:
         except (ImportError, RuntimeError) as e:
             print(f"ML models not loaded ({e}). "
                   "Pipeline can still run render/bake with pre-generated images.")
+
+    def _resolve_super_res_weights(self) -> str:
+        """Resolve RealESRGAN MLX weights path.
+
+        Reuses the HF repo (or local dir) used for the diffusion weights so a
+        single ``HUNYUAN3D_MLX_WEIGHTS_DIR`` override covers everything.
+        """
+        src = self.config.mlx_weights_source
+        filename = self.config.mlx_super_res_filename
+        env_override = os.environ.get("HUNYUAN3D_MLX_WEIGHTS_DIR")
+        if env_override:
+            return os.path.join(env_override, filename)
+        if os.path.isdir(src):
+            return os.path.join(src, filename)
+        from huggingface_hub import hf_hub_download
+        return hf_hub_download(repo_id=src, filename=filename)
 
     def _run_multiview_mlx(self, image_style, normal_maps, position_maps,
                             camera_azims):
@@ -271,6 +299,13 @@ class Hunyuan3DPaintPipelineMLX:
                 "albedo": list(multiviews_pbr["albedo"]),
                 "mr": list(multiviews_pbr["mr"]),
             }
+
+            # RealESRGAN x4 super-resolution per view (MLX)
+            if "mlx_super" in self.models:
+                sr = self.models["mlx_super"]
+                for i in range(len(enhance_images["albedo"])):
+                    enhance_images["albedo"][i] = sr(enhance_images["albedo"][i])
+                    enhance_images["mr"][i] = sr(enhance_images["mr"][i])
         else:
             if "multiview_model" not in self.models:
                 raise RuntimeError(

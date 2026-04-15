@@ -48,7 +48,10 @@ def main() -> None:
     cfg.render_size = 1024
     cfg.texture_size = 2048
     cfg.use_mlx_diffusion = True
-    cfg.mlx_num_inference_steps = 15
+    # PT uses 15 UniPC steps (multistep solver). We run DDIM-1st-order,
+    # which needs ~2x the step count to reach similar denoising quality
+    # — 25 steps + ~2 min longer is a fair quality tradeoff.
+    cfg.mlx_num_inference_steps = 25
 
     print("[1/2] Building pipeline...")
     t0 = time.time()

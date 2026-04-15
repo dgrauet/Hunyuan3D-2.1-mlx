@@ -118,9 +118,15 @@ def generate_multiview_pbr(
     # ------------------------------------------------------------------
     print("  Extracting reference features...")
     ref_latent = encode_images([reference_image])  # (1, h, w, 4)
-    ref_text_batch = text_albedo[None]  # (1, 77, 1024)
+    text_ref = model.learned_text_clip["ref"]  # PT uses learned_text_clip_ref
+    ref_text_batch = text_ref[None]  # (1, 77, 1024)
+    # Use the dual-stream reference UNet when available — its weights are
+    # different from the main UNet and are specifically trained to extract
+    # ref-attention features. Falling back to the main UNet (as we did) gives
+    # noticeably worse reference grounding.
+    ref_unet = getattr(model, "unet_dual", None) or model.unet
     ref_features = extract_reference_features(
-        model.unet, ref_latent, ref_text_batch
+        ref_unet, ref_latent, ref_text_batch
     )
     mx.synchronize()
 
@@ -198,25 +204,38 @@ def generate_multiview_pbr(
             text_full_c = text_full[mx.array(chunk_idx)]
             dino_c = dino_for_cfg[:n_c]
 
-            # Extra context for 2.5D attention
-            ctx = dict(
-                n_views=n_chunk,
-                n_pbr=n_pbr,
+            # 3 CFG passes (sequential to save memory).
+            # Mirrors the PyTorch pipeline (hunyuanpaintpbr/pipeline.py:300+,
+            # hunyuanpaintpbr/pipeline.py:685):
+            #   uncond  -> ref_scale=0, dino=zero, prompt=neg
+            #   ref     -> ref_scale=1, dino=zero, prompt=pos
+            #   full    -> ref_scale=1, dino=full, prompt=pos
+            # Then: noise = uncond + g*v*(ref - uncond) + g*v*(full - ref).
+            # Earlier we passed DINO to BOTH ref and full, making
+            # (full - ref) ~= 0 and dropping half of the guidance.
+
+            # uncond: no DINO, no ref features, neg text
+            pred_uncond = model.unet(
+                unet_in, t_arr, text_neg_c,
+                n_views=n_chunk, n_pbr=n_pbr,
+            )
+            mx.synchronize()
+
+            # ref: ref_features ON, DINO OFF, pos text
+            ctx_ref = dict(n_views=n_chunk, n_pbr=n_pbr)
+            if ref_features is not None:
+                ctx_ref["ref_features"] = ref_features
+            pred_ref = model.unet(unet_in, t_arr, text_full_c, **ctx_ref)
+            mx.synchronize()
+
+            # full: ref_features ON, DINO ON, pos text
+            ctx_full = dict(
+                n_views=n_chunk, n_pbr=n_pbr,
                 dino_features=dino_c,
             )
             if ref_features is not None:
-                ctx["ref_features"] = ref_features
-
-            # 3 CFG passes (sequential to save memory)
-            # uncond: no DINO, no ref
-            pred_uncond = model.unet(unet_in, t_arr, text_neg_c,
-                                     n_views=n_chunk, n_pbr=n_pbr)
-            mx.synchronize()
-            # ref: with DINO + ref features
-            pred_ref = model.unet(unet_in, t_arr, text_full_c, **ctx)
-            mx.synchronize()
-            # full: with DINO + ref features (same as ref for now)
-            pred_full = model.unet(unet_in, t_arr, text_full_c, **ctx)
+                ctx_full["ref_features"] = ref_features
+            pred_full = model.unet(unet_in, t_arr, text_full_c, **ctx_full)
             mx.synchronize()
 
             vs = view_scale[mx.array(chunk_idx)]

@@ -89,6 +89,24 @@ def _enhance_transformer_block(block, dim: int, cross_attention_dim: int):
     block.attn_refview.processor = RefProcessor(dim)
 
 
+def _assign_block_ids(unet: UNet2DConditionModelMLX) -> None:
+    """Assign sequential ``_block_id`` to every transformer block.
+
+    Used on the dual-stream reference UNet so its forward pass populates the
+    capture dict in the same order as the main UNet's reference-attention
+    expects (each transformer block reads ``condition_embed_dict[block_id]``).
+    Does not attach 2.5D modules — unet_dual is plain SD 2.1.
+    """
+    counter = 0
+    for blocks in (unet.down_blocks, [unet.mid_block], unet.up_blocks):
+        for block in blocks:
+            if hasattr(block, "attentions"):
+                for attn_block in block.attentions:
+                    for tb in attn_block.transformer_blocks:
+                        tb._block_id = str(counter)
+                        counter += 1
+
+
 def _enhance_unet(unet: UNet2DConditionModelMLX, cross_attention_dim: int = 1024):
     """Add 2.5D modules to all transformer blocks in a UNet.
 
@@ -162,13 +180,17 @@ def extract_reference_features(
     Returns:
         Dict mapping block id (str) to (1, L, C) feature tensors.
     """
-    # Prepare input
-    if condition_latents is not None:
+    # Prepare input — match the UNet's expected in_channels.
+    expected_in = unet.in_channels
+    if condition_latents is not None and expected_in == 12:
         unet_input = mx.concatenate([ref_latent, condition_latents], axis=-1)
-    else:
-        # Pad to 12 channels with zeros
+    elif expected_in == 12:
+        # Main UNet path (use_dual_stream=False in PT terms): pad with zeros
         pad = mx.zeros((*ref_latent.shape[:-1], 8))
         unet_input = mx.concatenate([ref_latent, pad], axis=-1)
+    else:
+        # Dual-stream UNet path (in_channels=4): pass the latent as-is
+        unet_input = ref_latent
 
     # Dict that BasicTransformerBlock will populate during the forward pass
     capture_dict: dict = {}
@@ -281,16 +303,21 @@ class HunyuanPaintModelMLX:
         _enhance_unet(unet, cross_attention_dim=1024)
 
         unet_w = dict(mx.load(str(weights_dir / "paint_unet.safetensors")))
-        # Strip 'unet.' prefix
-        stripped = {}
-        for k, v in unet_w.items():
-            if k.startswith("unet."):
-                stripped[k[5:]] = v
 
-        # Load matching weights (ignore unet_dual for now)
+        # The checkpoint contains TWO UNets:
+        #   unet.*       — main 2.5D UNet that runs the denoising loop
+        #   unet_dual.*  — vanilla SD 2.1 UNet that processes the reference
+        #                  image once to extract per-block features for
+        #                  reference-attention. Equivalent to PT's
+        #                  self.unet_dual when use_dual_stream=True.
+        stripped = {k[len("unet."):]: v for k, v in unet_w.items()
+                    if k.startswith("unet.")}
+        stripped_dual = {k[len("unet_dual."):]: v for k, v in unet_w.items()
+                         if k.startswith("unet_dual.")}
+
         model_keys = set(k for k, _ in tree_flatten(unet.parameters()))
 
-        # Handle .to_out_mr.0. → .to_out_mr. (ModuleList artifact)
+        # Handle .to_out_mr.0. -> .to_out_mr. (ModuleList artifact)
         normalized = {}
         for k, v in stripped.items():
             nk = k.replace(".to_out_mr.0.", ".to_out_mr.")
@@ -299,11 +326,8 @@ class HunyuanPaintModelMLX:
 
         matched = [(k, v) for k, v in normalized.items() if k in model_keys]
         unet.load_weights(matched)
-
-        n_total = len(stripped)
-        n_loaded = len(matched)
-        n_extra = n_total - n_loaded
-        print(f"  Loaded {n_loaded}/{n_total} UNet weights ({n_extra} unmatched)")
+        print(f"  Loaded {len(matched)}/{len(stripped)} main UNet weights"
+              f" ({len(stripped) - len(matched)} unmatched)")
 
         # --- Learned text embeddings ---
         learned = {}
@@ -328,7 +352,28 @@ class HunyuanPaintModelMLX:
         if proj_weights:
             image_proj.load_weights(proj_weights)
 
-        del unet_w, stripped
+        # --- Dual-stream reference UNet (vanilla SD 2.1 — no 2.5D modules) ---
+        # Takes 4-channel reference latent only (no normal/position concat
+        # — those are reserved for the main 12-ch UNet).
+        unet_dual = None
+        if stripped_dual:
+            print("Loading dual-stream reference UNet...")
+            unet_dual = UNet2DConditionModelMLX(
+                in_channels=4, out_channels=4,
+                block_out_channels=(320, 640, 1280, 1280),
+                cross_attention_dim=1024,
+                attention_head_dim=(5, 10, 20, 20),
+            )
+            # NOTE: do NOT call _enhance_unet — unet_dual is plain SD 2.1.
+            dual_keys = set(k for k, _ in tree_flatten(unet_dual.parameters()))
+            matched_dual = [(k, v) for k, v in stripped_dual.items()
+                            if k in dual_keys]
+            unet_dual.load_weights(matched_dual)
+            _assign_block_ids(unet_dual)
+            print(f"  Loaded {len(matched_dual)}/{len(stripped_dual)}"
+                  f" dual UNet weights")
+
+        del unet_w, stripped, stripped_dual
 
         scheduler = UniPCMultistepSchedulerMLX()
 
@@ -340,5 +385,6 @@ class HunyuanPaintModelMLX:
             learned_text_clip=learned,
             scheduler=scheduler,
         )
+        model.unet_dual = unet_dual
         print("All components loaded.")
         return model

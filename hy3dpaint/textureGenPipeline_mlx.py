@@ -370,7 +370,9 @@ class Hunyuan3DPaintPipelineMLX:
             self.render.set_texture_mr(texture_mr)
 
         # --- Save ---
-        self.render.save_mesh(output_mesh_path, downsample=True)
+        # Do NOT downsample: cv2.resize blends across UV gutters and produces
+        # visible color bleeding at island edges in the textured mesh.
+        self.render.save_mesh(output_mesh_path, downsample=False)
 
         if save_glb:
             glb_path = output_mesh_path.replace(".obj", ".glb")

@@ -593,6 +593,9 @@ class MeshRenderMLX:
         self.tex_grid = grid_visible        # (K, 2) int
         self.texture_indices = texture_indices.reshape(th, tw)  # (H, W)
 
+        # Per-texel face id (1-indexed, 0 = empty), for per-face bake merging
+        self.tex_face_id = np.array(tri_ids).astype(np.int32)  # (H, W)
+
     def uv_feature_map(self, vert_feat):
         """Map per-vertex features to UV texture space.
 
@@ -829,19 +832,20 @@ class MeshRenderMLX:
             boundary_map.reshape(th, tw, 1),
         )
 
-    def fast_bake_texture(self, textures, cos_maps, mode="wta"):
+    def fast_bake_texture(self, textures, cos_maps, mode="face_wta"):
         """Merge multiple view textures into a single UV atlas.
 
-        Two modes:
-          - ``"wta"`` (default): each texel takes the color of the view with
-            the highest weighted-cos contribution. Per-view diffusion outputs
-            differ slightly even for the same 3D point, so cosine-weighted
-            averaging produces visible color noise on regions covered by
-            multiple oblique views (especially the front face). Picking a
-            single dominant view per texel keeps the bake crisp and matches
-            the diffusion's intent for that surface.
+        Three modes:
+          - ``"face_wta"`` (default): pick one view per UV face (the view
+            with the highest summed cos over the face's texels) and bake
+            the entire face from that view. Eliminates the intra-island
+            color stripes that per-texel WTA produces when neighboring
+            texels of the same face/island fall to different "best" views.
+          - ``"wta"``: per-texel argmax of weighted cos. Faster but can
+            produce visible stripes within a single UV island.
           - ``"weighted"`` (PyTorch parity): cosine-weighted average of all
-            views.
+            views. Mixes slightly-different per-view colors and tends to
+            produce rainbow speckles on multi-view-covered regions.
 
         Args:
             textures: list of (H, W, C) numpy arrays.
@@ -854,6 +858,38 @@ class MeshRenderMLX:
         """
         if not textures:
             raise ValueError("fast_bake_texture: no textures provided")
+
+        if mode == "face_wta":
+            # Per-face WTA: aggregate cos per (face, view), pick best view per
+            # face, then bake all of that face's texels from that view.
+            if getattr(self, "tex_face_id", None) is None:
+                # Fall back to per-texel WTA if face ids aren't available
+                mode = "wta"
+            else:
+                stack_t = np.stack(textures, axis=0)              # (V, H, W, C)
+                stack_c = np.stack([c[..., 0] for c in cos_maps], axis=0)  # (V, H, W)
+                face_ids = self.tex_face_id                        # (H, W) 1-indexed
+                V = stack_c.shape[0]
+                n_faces = int(face_ids.max())
+                # Sum cos per (view, face)
+                flat_face = face_ids.reshape(-1)
+                valid = flat_face > 0
+                face_idx = (flat_face[valid] - 1).astype(np.int64)
+                stack_c_flat = stack_c.reshape(V, -1)[:, valid]    # (V, K)
+                cos_per_face = np.zeros((V, n_faces), dtype=np.float32)
+                for v in range(V):
+                    np.add.at(cos_per_face[v], face_idx, stack_c_flat[v])
+                best_view_per_face = cos_per_face.argmax(axis=0)   # (n_faces,)
+                # Per-texel best view from face lookup
+                best_per_texel = np.zeros_like(face_ids, dtype=np.int64)
+                best_per_texel[face_ids > 0] = best_view_per_face[face_ids[face_ids > 0] - 1]
+                # Painted = any view contributed at this texel
+                best_c = stack_c.max(axis=0)
+                H, W = face_ids.shape
+                ii, jj = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+                merged = stack_t[best_per_texel, ii, jj]
+                merged[best_c == 0] = 0
+                return merged, (best_c > 0)[..., None]
 
         if mode == "wta":
             stack_t = np.stack(textures, axis=0)

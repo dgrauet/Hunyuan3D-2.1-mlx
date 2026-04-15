@@ -87,59 +87,51 @@ class UniPCMultistepSchedulerMLX:
     def step(
         self, model_output: mx.array, timestep: int, sample: mx.array
     ) -> mx.array:
-        """Perform one scheduler step.
+        """DDIM-style step with v_prediction.
 
-        Args:
-            model_output: (B, C, H, W) predicted noise.
-            timestep: current timestep.
-            sample: (B, C, H, W) current noisy sample.
+        Proper DDIM in alpha/sigma parameterization:
+          x0_pred = alpha_t * x_t - sigma_t * v_pred
+          eps_pred = sigma_t * x_t + alpha_t * v_pred
+          x_next = alpha_next * x0_pred + sigma_next * eps_pred
 
-        Returns:
-            Denoised sample for the next step.
+        Matches what diffusers DDIM does with v_prediction + zero-SNR
+        (``rescale_betas_zero_snr=True`` makes sigma_t -> 1 at t=T, so
+        initial latents don't need sigma_max rescaling).
         """
         t = int(timestep)
         step_idx = self._step_index
 
-        # Shift model outputs buffer
-        self.model_outputs = self.model_outputs[1:] + [model_output]
-
-        # Get next timestep
         if step_idx + 1 < len(self.timesteps):
             t_next = int(self.timesteps[step_idx + 1])
         else:
-            t_next = 0
+            t_next = -1  # sentinel for "past end"
 
-        # Signal and noise coefficients
         alpha_t = float(self.alpha_t[t])
         sigma_t = float(self.sigma_t[t])
-        lambda_t_val = float(self.lambda_t[t])
 
-        if t_next > 0:
+        if t_next >= 0:
             alpha_next = float(self.alpha_t[t_next])
             sigma_next = float(self.sigma_t[t_next])
-            lambda_next = float(self.lambda_t[t_next])
         else:
+            # End of trajectory: go to clean x0
             alpha_next = 1.0
             sigma_next = 0.0
-            lambda_next = float("inf")
 
-        h = lambda_next - lambda_t_val
-
-        # Convert model output to x0 prediction
         if self.config.prediction_type == "epsilon":
-            x0_pred = (sample - sigma_t * model_output) / alpha_t
+            eps_pred = model_output
+            x0_pred = (sample - sigma_t * eps_pred) / max(alpha_t, 1e-8)
         elif self.config.prediction_type == "v_prediction":
             x0_pred = alpha_t * sample - sigma_t * model_output
+            eps_pred = sigma_t * sample + alpha_t * model_output
         else:
             x0_pred = model_output
+            eps_pred = (sample - alpha_t * x0_pred) / max(sigma_t, 1e-8)
 
-        # First-order update (DDIM-style)
-        if sigma_t > 1e-8:
-            # Compute noise component
-            noise_component = (sample - alpha_t * x0_pred) / sigma_t
-            prev_sample = alpha_next * x0_pred + sigma_next * noise_component
-        else:
-            prev_sample = alpha_next * x0_pred
+        x_next = alpha_next * x0_pred + sigma_next * eps_pred
+
+        # Keep the x0 prediction buffer fresh (used for optional multistep
+        # correction in a future upgrade; single-step DDIM ignores it).
+        self.model_outputs = self.model_outputs[1:] + [x0_pred]
 
         self._step_index += 1
-        return prev_sample
+        return x_next

@@ -201,7 +201,7 @@ def generate_multiview_pbr(
         # view denoise with reference + DINO + cross-attn only — visibly
         # cleaner per-view output and the WTA bake then enforces inter-view
         # consistency at texel level.
-        chunk_size = 2
+        chunk_size = n_views
         t_arr = mx.array([t_int])
         noise_guided = mx.zeros_like(latents)
 

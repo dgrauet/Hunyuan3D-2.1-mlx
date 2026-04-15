@@ -375,9 +375,12 @@ class BasicTransformerBlock(nn.Module):
         if has_25d and n_views > 1:
             B_total, L, C = hidden_states.shape
             B_mat = B_total // n_views  # B * n_pbr
-            norm_hs = self.norm1(hidden_states)
 
-            # Reshape to concat views: (B*n_pbr, n_views*L, C)
+            # IMPORTANT: PT uses the SAME norm_hidden_states for self-attn,
+            # ref-attn, and multiview-attn — all computed from the ORIGINAL
+            # input to the block. Recomputing norm1(updated_hidden_states)
+            # here was producing a totally different signal and led to
+            # tiger-stripe-style noise when MV was active.
             mv_input = norm_hs.reshape(B_mat, n_views * L, C)
 
             # Optional 3D RoPE (matches PT's PoseRoPEAttnProcessor):

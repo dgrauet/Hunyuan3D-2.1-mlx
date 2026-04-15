@@ -84,7 +84,11 @@ def generate_multiview_pbr(
             arr = np.array(pil).astype(np.float32) / 255.0
             arrays.append(arr)
         batch = mx.array(np.stack(arrays))  # (N, H, W, 3)
-        return model.vae.encode(batch * 2 - 1) * scaling_factor
+        # vae.encode already multiplies by self.scaling_factor internally;
+        # do NOT re-multiply (was double-scaling latents to ~0.033 of the
+        # expected magnitude, making ref_latents and z_normal/z_pos
+        # essentially invisible to the UNet → washed-out diffusion output).
+        return model.vae.encode(batch * 2 - 1)
 
     z_normal = encode_images(normal_maps)   # (N, h, w, 4)
     z_pos = encode_images(position_maps)    # (N, h, w, 4)
@@ -307,7 +311,9 @@ def generate_multiview_pbr(
     all_images = []
     n_total = n_pbr * n_views
     for idx in range(n_total):
-        z_i = latents[idx : idx + 1] / scaling_factor
+        # latents already at scaling_factor magnitude; vae.decode handles
+        # the divide internally — pass z as-is.
+        z_i = latents[idx : idx + 1]
         dec_i = model.vae.decode(z_i)
         img_i = mx.clip((dec_i + 1) / 2, 0, 1)
         mx.synchronize()

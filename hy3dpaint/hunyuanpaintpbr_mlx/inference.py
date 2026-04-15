@@ -193,12 +193,15 @@ def generate_multiview_pbr(
     for i, t in enumerate(model.scheduler.timesteps):
         t_int = int(t)
 
-        # Process all views together so that the multi-view attention
-        # (which needs n_views > 1 to fire) can share information across
-        # views. With chunk_size=1 the multiview attention path is silently
-        # disabled and each view denoises independently — that's what was
-        # producing inconsistent colors at view boundaries.
-        chunk_size = n_views
+        # Multiview attention with all views in a single forward and 3D RoPE
+        # is the most PT-faithful path but produces visibly degraded output
+        # in MLX (suspected mx.fast.scaled_dot_product_attention numerical
+        # behaviour at L=24k tokens with rotated Q/K). chunk_size=1 keeps
+        # multiview attention disabled (n_views=1 in kwargs) and lets each
+        # view denoise with reference + DINO + cross-attn only — visibly
+        # cleaner per-view output and the WTA bake then enforces inter-view
+        # consistency at texel level.
+        chunk_size = 1
         t_arr = mx.array([t_int])
         noise_guided = mx.zeros_like(latents)
 

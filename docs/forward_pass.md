@@ -217,6 +217,47 @@ mid_block (UNetMidBlock2DCrossAttn)                                    │
 conv_norm_out + SiLU + conv_out → (B*n_pbr*n_views, h, w, 4) noise prediction
 ```
 
+## Critical invariants (learned the hard way)
+
+Two classes of subtle bugs produced visibly degraded output for us; both
+follow the same pattern — **a norm tensor is computed once and every
+attention path in that step must reuse it, never recompute against the
+updated hidden_states**:
+
+1. **norm1 invariant**: in each transformer block, `norm1(hidden_states)`
+   is computed once. Self-attn (or MDA), reference-attn, and multiview-
+   attn all consume that single `norm_hs`. The block's hidden_states
+   accumulates additive updates from each attention but `norm_hs` itself
+   is NEVER recomputed inside the block.
+
+2. **norm2 invariant**: same for `norm2`. Computed once. Text cross-attn
+   AND DINO cross-attn both consume the pre-attn2 `norm2_hs`.
+   Recomputing after attn2 feeds DINO a signal off by attn2's residual,
+   which weakens the reference/style conditioning downstream.
+
+Other PT-parity traps to watch for when porting:
+
+- **VAE encode/decode scale**: `vae.encode()` multiplies by
+  `scaling_factor` internally; `vae.decode()` divides by it. Callers
+  must NOT scale again. (We doubled it once and conditioning latents
+  ended up 30x too small.)
+- **`position_voxel_indices` lookup key**: indexed by the *multiview*
+  sequence length `n_views * L`, not per-view `L` — matches
+  `multivew_hidden_states.shape[1]` in PT's modules.py.
+- **Dual-stream reference UNet**: the checkpoint ships BOTH a main
+  `unet.*` (2.5D) AND a vanilla `unet_dual.*` (plain SD 2.1) for
+  reference feature extraction. Must load both.
+- **3-pass CFG DINO/ref routing**: uncond has no DINO/no ref; ref has
+  ref only; full has both. Passing DINO to both ref AND full collapses
+  the `full - ref` guidance term.
+- **DINOv2**: run at native 518x518 with fp32 weights — pos_embed
+  interpolation to 224 amplifies ~450x through 40 blocks.
+- **Per-material ref-attn V/out**: `attn_refview.processor.to_v_mr` /
+  `to_out_mr` exist in the checkpoint and are required for non-albedo
+  materials to get reference conditioning.
+- **Diffusers `attention_head_dim`**: is a misnomer — it's the number
+  of heads, not per-head dim. `head_dim = channels // attention_head_dim`.
+
 ## Tensor shapes for default config (resolution=512, 6 views, 2 PBR materials)
 
 | Stage | Tensor | Shape | Notes |

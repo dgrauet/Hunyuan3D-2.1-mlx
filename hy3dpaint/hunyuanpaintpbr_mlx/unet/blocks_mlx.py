@@ -304,31 +304,70 @@ class BasicTransformerBlock(nn.Module):
             if block_id is not None and block_id in ref_features:
                 ref_ctx = ref_features[block_id]  # (B_ref, n_ref*L, C)
                 B_total, L, C = hidden_states.shape
-                # n_views > 0 and n_pbr set by inference loop
                 nv = max(int(n_views) if n_views else 1, 1)
                 np_ = max(int(n_pbr) if n_pbr else 1, 1)
                 B_batch = B_total // (np_ * nv)
-                # Reshape: (B*n_pbr*n_views, L, C) -> (B, n_pbr, n_views, L, C)
-                # layout must match inference ordering: [albedo_v0..vN-1, mr_v0..vN-1]
-                # which in (b, n_pbr, n) indexing is b-major, then n_pbr, then n.
-                nh = norm_hs.reshape(B_batch, np_, nv, L, C)
-                # Albedo only, views concatenated into sequence: (B, n*L, C)
-                query_albedo = nh[:, 0].reshape(B_batch, nv * L, C)
 
-                # Broadcast ref context if needed
+                # Reshape: (B*n_pbr*n_views, L, C) -> (B, n_pbr, n_views, L, C)
+                # PT modules.py:586-609 takes albedo only as the query but
+                # then RefAttnProcessor2_0 internally produces a per-material
+                # output by applying material-specific V/out projections
+                # (to_v_mr / to_out_mr from the processor). Albedo uses the
+                # plain attn_refview.to_v / to_out.
+                nh = norm_hs.reshape(B_batch, np_, nv, L, C)
+                query_albedo = nh[:, 0].reshape(B_batch, nv * L, C)  # (B, nv*L, C)
+
                 if ref_ctx.shape[0] < query_albedo.shape[0]:
                     ref_ctx = mx.broadcast_to(
                         ref_ctx,
                         (query_albedo.shape[0],) + ref_ctx.shape[1:],
                     )
 
-                ref_out = self.attn_refview(query_albedo, ref_ctx)  # (B, nv*L, C)
-                ref_out = ref_out.reshape(B_batch, 1, nv, L, C)
-                if np_ > 1:
-                    zeros = mx.zeros((B_batch, np_ - 1, nv, L, C), dtype=ref_out.dtype)
-                    ref_out_full = mx.concatenate([ref_out, zeros], axis=1)
-                else:
-                    ref_out_full = ref_out
+                attn = self.attn_refview
+                heads = attn.heads
+                head_dim = attn.dim_head
+
+                def _split_heads(t, B):
+                    return t.reshape(B, -1, heads, head_dim).transpose(0, 2, 1, 3)
+
+                # Q, K shared across materials (computed from albedo query +
+                # ref ctx). V depends on material — albedo uses to_v, MR uses
+                # processor.to_v_mr. Attention scores are the same for all
+                # materials (same Q, same K), so we compute scores once and
+                # reuse.
+                q = _split_heads(attn.to_q(query_albedo), query_albedo.shape[0])
+                k = _split_heads(attn.to_k(ref_ctx), ref_ctx.shape[0])
+                scale = head_dim ** -0.5
+
+                ref_out_per_mat = []
+                for mat_i in range(np_):
+                    if mat_i == 0:
+                        v_proj = attn.to_v
+                        out_proj = attn.to_out
+                    else:
+                        # PBR materials beyond albedo use the per-material
+                        # processor weights (to_v_mr, to_out_mr).
+                        proc = getattr(attn, "processor", None)
+                        if proc is None or not hasattr(proc, "to_v_mr"):
+                            ref_out_per_mat.append(
+                                mx.zeros((B_batch, nv * L, C), dtype=q.dtype)
+                            )
+                            continue
+                        v_proj = proc.to_v_mr
+                        out_proj = proc.to_out_mr
+
+                    v = _split_heads(v_proj(ref_ctx), ref_ctx.shape[0])
+                    attn_out = mx.fast.scaled_dot_product_attention(
+                        q, k, v, scale=scale,
+                    )
+                    attn_out = attn_out.transpose(0, 2, 1, 3).reshape(
+                        B_batch, nv * L, C
+                    )
+                    ref_out_per_mat.append(out_proj(attn_out))
+
+                # (B, np, nv*L, C) -> (B, np, nv, L, C) -> (B*np*nv, L, C)
+                ref_out_full = mx.stack(ref_out_per_mat, axis=1)
+                ref_out_full = ref_out_full.reshape(B_batch, np_, nv, L, C)
                 ref_out_flat = ref_out_full.reshape(B_total, L, C)
                 hidden_states = hidden_states + ref_out_flat
 

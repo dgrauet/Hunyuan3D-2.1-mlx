@@ -38,25 +38,37 @@ def _seed_vertex_colors(
     texture: np.ndarray, mask: np.ndarray, vtx_uv: np.ndarray,
     pos_idx: np.ndarray, uv_idx: np.ndarray, V: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Read each vertex's color from its already-painted UV texel (if any)."""
+    """Read each vertex's color from its painted UV texels.
+
+    A 3D vertex can show up in several UV islands (UV unwrapping splits along
+    seams). Each island gives a potentially different color. We average all
+    painted readings per 3D vertex instead of taking the last write — last-
+    write-wins introduces visible stripes on faces where one UV vertex was
+    seeded from view A and another from view B with slightly different
+    diffusion output.
+    """
     H, W, C = texture.shape
 
-    # Compute integer UV coords for every (face, vertex) pair, vectorized
-    flat_uv_idx = uv_idx.reshape(-1)            # (3F,)
-    uv_xy = vtx_uv[flat_uv_idx]                  # (3F, 2)
+    flat_uv_idx = uv_idx.reshape(-1)
+    uv_xy = vtx_uv[flat_uv_idx]
     cols = np.clip(np.round(uv_xy[:, 0] * (W - 1)).astype(np.int64), 0, W - 1)
     rows = np.clip(np.round(uv_xy[:, 1] * (H - 1)).astype(np.int64), 0, H - 1)
 
-    flat_pos = pos_idx.reshape(-1)               # (3F,)
-    painted = mask[rows, cols] > 0               # (3F,) bool
-    colors = texture[rows, cols]                 # (3F, C)
+    flat_pos = pos_idx.reshape(-1)
+    painted = mask[rows, cols] > 0
+    colors = texture[rows, cols]
 
-    vtx_color = np.zeros((V, C), dtype=np.float32)
-    vtx_mask = np.zeros(V, dtype=np.float32)
     valid_v = flat_pos[painted]
     valid_c = colors[painted]
-    vtx_color[valid_v] = valid_c
-    vtx_mask[valid_v] = 1.0
+
+    vtx_color = np.zeros((V, C), dtype=np.float32)
+    vtx_count = np.zeros(V, dtype=np.float32)
+    np.add.at(vtx_color, valid_v, valid_c)
+    np.add.at(vtx_count, valid_v, 1.0)
+
+    vtx_mask = (vtx_count > 0).astype(np.float32)
+    nonzero = vtx_count > 0
+    vtx_color[nonzero] /= vtx_count[nonzero, None]
     return vtx_color, vtx_mask
 
 

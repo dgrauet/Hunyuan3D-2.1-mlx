@@ -829,22 +829,48 @@ class MeshRenderMLX:
             boundary_map.reshape(th, tw, 1),
         )
 
-    def fast_bake_texture(self, textures, cos_maps):
-        """Merge multiple view textures using cosine-weighted blending.
+    def fast_bake_texture(self, textures, cos_maps, mode="wta"):
+        """Merge multiple view textures into a single UV atlas.
+
+        Two modes:
+          - ``"wta"`` (default): each texel takes the color of the view with
+            the highest weighted-cos contribution. Per-view diffusion outputs
+            differ slightly even for the same 3D point, so cosine-weighted
+            averaging produces visible color noise on regions covered by
+            multiple oblique views (especially the front face). Picking a
+            single dominant view per texel keeps the bake crisp and matches
+            the diffusion's intent for that surface.
+          - ``"weighted"`` (PyTorch parity): cosine-weighted average of all
+            views.
 
         Args:
             textures: list of (H, W, C) numpy arrays.
-            cos_maps: list of (H, W, 1) numpy arrays.
+            cos_maps: list of (H, W, 1) numpy arrays (already weighted).
+            mode: "wta" or "weighted".
 
         Returns:
             texture_merge: (H, W, C) numpy array.
             trust_map: (H, W, 1) boolean numpy array.
         """
+        if not textures:
+            raise ValueError("fast_bake_texture: no textures provided")
+
+        if mode == "wta":
+            stack_t = np.stack(textures, axis=0)
+            stack_c = np.stack([c[..., 0] for c in cos_maps], axis=0)
+            best = stack_c.argmax(axis=0)
+            best_c = stack_c.max(axis=0)
+            H, W = best.shape
+            ii, jj = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+            merged = stack_t[best, ii, jj]
+            merged[best_c == 0] = 0
+            return merged, (best_c > 0)[..., None]
+
+        # PyTorch-parity weighted average path
         channel = textures[0].shape[-1]
         th, tw = self.texture_size
         texture_merge = np.zeros((th, tw, channel), dtype=np.float32)
         trust_map = np.zeros((th, tw, 1), dtype=np.float32)
-
         for texture, cos_map in zip(textures, cos_maps):
             view_sum = (cos_map > 0).sum()
             if view_sum == 0:
@@ -854,7 +880,6 @@ class MeshRenderMLX:
                 continue
             texture_merge += texture * cos_map
             trust_map += cos_map
-
         texture_merge = texture_merge / np.maximum(trust_map, 1e-8)
         return texture_merge, trust_map > 1e-8
 

@@ -119,18 +119,20 @@ def _rasterize_face_with_colors(
     uv0: np.ndarray, uv1: np.ndarray, uv2: np.ndarray,
     c0: np.ndarray, c1: np.ndarray, c2: np.ndarray,
 ) -> None:
-    """Rasterize a triangle in UV space and fill texels with bary-interpolated colors.
+    """Fill UNPAINTED texels inside a UV triangle with bary-interpolated colors.
 
-    All UV coords are in [0, 1]. Modifies tex, msk in place.
+    Only writes to texels where ``msk == 0``. Texels that were already painted
+    by back-projection keep their per-view color — overwriting them with a
+    smoothed bary-interp blend reintroduces the noise we're trying to avoid.
+
+    Modifies tex, msk in place.
     """
     H, W, _ = tex.shape
 
-    # Convert UVs to pixel coordinates (col = u*W, row = v*H, V already flipped)
     p0 = np.array([uv0[0] * (W - 1), uv0[1] * (H - 1)], dtype=np.float32)
     p1 = np.array([uv1[0] * (W - 1), uv1[1] * (H - 1)], dtype=np.float32)
     p2 = np.array([uv2[0] * (W - 1), uv2[1] * (H - 1)], dtype=np.float32)
 
-    # Bounding box (clipped to image)
     x_min = max(int(np.floor(min(p0[0], p1[0], p2[0]))), 0)
     x_max = min(int(np.ceil(max(p0[0], p1[0], p2[0]))), W - 1)
     y_min = max(int(np.floor(min(p0[1], p1[1], p2[1]))), 0)
@@ -138,15 +140,13 @@ def _rasterize_face_with_colors(
     if x_max < x_min or y_max < y_min:
         return
 
-    # Edge-function rasterization with barycentric coords
     xs, ys = np.meshgrid(
         np.arange(x_min, x_max + 1), np.arange(y_min, y_max + 1),
         indexing="xy",
     )
-    xs = xs.astype(np.float32) + 0.5  # pixel centers
+    xs = xs.astype(np.float32) + 0.5
     ys = ys.astype(np.float32) + 0.5
 
-    # Barycentric coordinates
     denom = (p1[1] - p2[1]) * (p0[0] - p2[0]) + (p2[0] - p1[0]) * (p0[1] - p2[1])
     if abs(denom) < 1e-9:
         return
@@ -159,13 +159,18 @@ def _rasterize_face_with_colors(
     if not inside.any():
         return
 
-    # Interpolate colors
-    rows_local, cols_local = np.where(inside)
+    # Skip texels already painted to preserve their original WTA values
+    msk_window = msk[y_min:y_max + 1, x_min:x_max + 1]
+    fill = inside & (msk_window == 0)
+    if not fill.any():
+        return
+
+    rows_local, cols_local = np.where(fill)
     rows_global = rows_local + y_min
     cols_global = cols_local + x_min
-    bw0 = w0[inside][:, None]
-    bw1 = w1[inside][:, None]
-    bw2 = w2[inside][:, None]
+    bw0 = w0[fill][:, None]
+    bw1 = w1[fill][:, None]
+    bw2 = w2[fill][:, None]
     interp = bw0 * c0 + bw1 * c1 + bw2 * c2
 
     tex[rows_global, cols_global] = interp

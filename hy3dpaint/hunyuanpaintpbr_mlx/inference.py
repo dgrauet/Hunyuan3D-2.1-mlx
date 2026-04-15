@@ -21,29 +21,34 @@ from .load_model import HunyuanPaintModelMLX, extract_reference_features
 def _compute_dino_features_hf(model, ref_u8: np.ndarray) -> mx.array:
     """Run HF DINOv2-giant once on the reference image.
 
-    Caches the model+processor on ``model`` for subsequent calls. Falls
-    back to the pure MLX DINO if HF transformers isn't available.
+    Uses fp16 on CPU (1.2GB vs 4.4GB fp32) to avoid OOM with the paint
+    UNet + dual UNet + VAE + super-res all resident. Frees the model
+    after feature extraction.
+
+    Falls back to pure MLX DINO if HF transformers isn't available.
     """
     try:
         import torch
+        import gc as _gc
         from transformers import AutoImageProcessor, AutoModel
         from PIL import Image as PILImage
     except Exception:
         from .dino_mlx import preprocess_for_dino
         return model.dino(preprocess_for_dino(ref_u8))
 
-    if not hasattr(model, "_hf_dino_cache"):
-        proc = AutoImageProcessor.from_pretrained("facebook/dinov2-giant")
-        pt_dino = AutoModel.from_pretrained("facebook/dinov2-giant")
-        for p in pt_dino.parameters():
-            p.requires_grad_(False)
-        model._hf_dino_cache = (proc, pt_dino)
-    proc, pt_dino = model._hf_dino_cache
-
+    proc = AutoImageProcessor.from_pretrained("facebook/dinov2-giant")
+    pt_dino = AutoModel.from_pretrained(
+        "facebook/dinov2-giant", torch_dtype=torch.float16,
+    )
+    for p in pt_dino.parameters():
+        p.requires_grad_(False)
     pt_in = proc(images=PILImage.fromarray(ref_u8), return_tensors="pt")
     with torch.no_grad():
-        pt_feat = pt_dino(pt_in.pixel_values)[0]
-    return mx.array(pt_feat.numpy())
+        pt_feat = pt_dino(pt_in.pixel_values.half())[0]
+    out = mx.array(pt_feat.float().numpy())
+    del proc, pt_dino, pt_in, pt_feat
+    _gc.collect()
+    return out
 
 
 def _cam_mapping(azim: float) -> float:
@@ -146,14 +151,13 @@ def generate_multiview_pbr(
         ref_u8 = (reference_image * 255).astype(np.uint8)
     else:
         ref_u8 = reference_image
-    # Pure MLX DINO at native 518 (1370 tokens). HF DINO would give
-    # bit-exact PT parity (224 input, 257 tokens) but co-loading both
-    # plus the paint UNet + dual UNet + VAE OOMs 32 GB unified memory.
-    # Our attn_dino down the line is a Linear(1536 -> inner_dim) that
-    # consumes any token count — the extra tokens give richer context
-    # at the cost of running off the training distribution.
-    dino_in = preprocess_for_dino(ref_u8)
-    dino_feat = model.dino(dino_in)
+    # Use HF DINOv2 (fp16, CPU) for exact PT-parity 257-token output.
+    # Freeing MLX DINO before HF loads to fit in 32 GB unified memory.
+    if getattr(model, "dino", None) is not None:
+        model.dino = None
+        import gc as _gc
+        _gc.collect()
+    dino_feat = _compute_dino_features_hf(model, ref_u8)
     dino_proj = model.image_proj(dino_feat)
     mx.synchronize()
 

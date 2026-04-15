@@ -432,18 +432,16 @@ class BasicTransformerBlock(nn.Module):
             hidden_states = mv_out + hidden_states
 
         # --- Step 4: Text cross-attention ---
-        hidden_states = (
-            self.attn2(self.norm2(hidden_states), encoder_hidden_states)
-            + hidden_states
-        )
+        # PT modules.py computes norm2 ONCE and reuses it for BOTH text
+        # and DINO cross-attention (DINO uses the pre-attn2 norm, not the
+        # post-attn2 recomputed one).
+        norm2_hs = self.norm2(hidden_states)
+        hidden_states = self.attn2(norm2_hs, encoder_hidden_states) + hidden_states
 
         # --- Step 5: DINO cross-attention ---
         dino_features = kwargs.get("dino_features")
         if has_25d and hasattr(self, "attn_dino") and dino_features is not None:
-            hidden_states = (
-                self.attn_dino(self.norm2(hidden_states), dino_features)
-                + hidden_states
-            )
+            hidden_states = self.attn_dino(norm2_hs, dino_features) + hidden_states
 
         # --- Step 6: FFN ---
         hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states

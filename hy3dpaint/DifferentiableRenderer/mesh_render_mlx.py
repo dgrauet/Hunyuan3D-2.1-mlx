@@ -519,14 +519,22 @@ class MeshRenderMLX:
             mr_tex_img = None
             mr_atlas = getattr(self, "tex_mr", None)
             if mr_atlas is not None:
-                # glTF packs metallic in B, roughness in G (R unused).
-                # Our MR atlas comes from the diffusion MR material and
-                # has the right channel layout from the PT pipeline's
-                # back-projection: albedo not used in MR view.
+                # Repack for glTF: the diffusion MR atlas uses R=metallic,
+                # G=roughness (PT convention, see MeshRender.get_texture_mr),
+                # but glTF metallicRoughnessTexture expects B=metallic,
+                # G=roughness, R ignored (occlusion in some pipelines).
+                # Without this swap, glTF viewers read metallic=0 and the
+                # mesh looks uniformly dielectric.
                 mr_u8 = (np.clip(mr_atlas, 0, 1) * 255).astype(np.uint8)
                 if mr_u8.ndim == 2:
                     mr_u8 = np.stack([mr_u8, mr_u8, mr_u8], axis=-1)
-                mr_tex_img = PILImage.fromarray(mr_u8)
+                metallic_ch = mr_u8[..., 0]
+                roughness_ch = mr_u8[..., 1]
+                mr_gltf = np.stack(
+                    [np.zeros_like(metallic_ch), roughness_ch, metallic_ch],
+                    axis=-1,
+                )
+                mr_tex_img = PILImage.fromarray(mr_gltf)
 
             kwargs = dict(
                 name="paint_pbr",

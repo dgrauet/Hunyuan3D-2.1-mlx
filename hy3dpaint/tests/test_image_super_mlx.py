@@ -148,10 +148,25 @@ class TestPixelUnshuffle:
 # ---------------------------------------------------------------------------
 
 
-WEIGHTS_PATH = os.environ.get("REALESRGAN_MLX_WEIGHTS", None)
+def _resolve_realesrgan_weights():
+    """Local override, else fetch from HF (same repo as the paint model)."""
+    env = os.environ.get("REALESRGAN_MLX_WEIGHTS")
+    if env and os.path.exists(env):
+        return env
+    try:
+        from huggingface_hub import hf_hub_download
+        return hf_hub_download(
+            repo_id="dgrauet/hunyuan3d-2.1-mlx",
+            filename="realesrgan_x4plus.safetensors",
+        )
+    except Exception:
+        return None
 
 
-@pytest.mark.skipif(WEIGHTS_PATH is None, reason="Set REALESRGAN_MLX_WEIGHTS env var to test weight loading")
+WEIGHTS_PATH = _resolve_realesrgan_weights()
+
+
+@pytest.mark.skipif(WEIGHTS_PATH is None, reason="Could not resolve RealESRGAN MLX weights (no env var, HF download failed)")
 class TestWeightLoading:
     """Tests that require converted MLX weights."""
 

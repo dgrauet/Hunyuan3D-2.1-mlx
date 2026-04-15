@@ -47,14 +47,29 @@ class UniPCMultistepSchedulerMLX:
         alphas = 1.0 - betas
         self.alphas_cumprod = np.cumprod(alphas)
 
-        # Rescale for zero terminal SNR (SD 2.1 uses this)
+        # Rescale for zero terminal SNR. PT's rescale_zero_terminal_snr
+        # shifts AND scales the entire sqrt(alpha_cumprod) curve so that
+        # it starts at the original sqrt(alpha_cumprod[0]) and terminates
+        # EXACTLY at 0 — not a single-point clamp. Shifting the whole
+        # curve changes the SNR at EVERY timestep, not just the last one.
+        # Previously we were clamping only the terminal point, which left
+        # every intermediate step using the un-rescaled schedule and
+        # produced visibly desaturated outputs (the model's denoising
+        # targets were shifted off its training distribution).
         if config.rescale_betas_zero_snr:
-            self.alphas_cumprod[-1] = 2 ** -24  # ~0, avoids log(0)
+            alphas_bar_sqrt = np.sqrt(self.alphas_cumprod)
+            sqrt_0 = alphas_bar_sqrt[0].copy()
+            sqrt_T = alphas_bar_sqrt[-1].copy()
+            alphas_bar_sqrt = alphas_bar_sqrt - sqrt_T
+            alphas_bar_sqrt = alphas_bar_sqrt * sqrt_0 / (sqrt_0 - sqrt_T)
+            self.alphas_cumprod = alphas_bar_sqrt ** 2
+            # Avoid exact 0 at terminal (would make lambda_t -> -inf).
+            self.alphas_cumprod[-1] = max(self.alphas_cumprod[-1], 2 ** -24)
 
         # Precompute for signal/noise ratio
         self.alpha_t = np.sqrt(self.alphas_cumprod)
         self.sigma_t = np.sqrt(1.0 - self.alphas_cumprod)
-        self.lambda_t = np.log(self.alpha_t / self.sigma_t)
+        self.lambda_t = np.log(self.alpha_t / np.maximum(self.sigma_t, 1e-12))
 
         self.num_inference_steps = None
         self.timesteps = None

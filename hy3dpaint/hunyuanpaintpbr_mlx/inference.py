@@ -11,6 +11,7 @@ Reproduces the PyTorch pipeline's denoising loop:
 from typing import Dict, List, Optional
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 from PIL import Image
 
@@ -151,14 +152,25 @@ def generate_multiview_pbr(
         ref_u8 = (reference_image * 255).astype(np.uint8)
     else:
         ref_u8 = reference_image
-    # Pure MLX DINO at native 518 (1370 tokens). HF DINO bridge for
-    # PT-exact 257 tokens was tried in fp32 AND fp16 — both OOM 32 GB
-    # unified memory when co-resident with the paint UNet + dual UNet
-    # + VAE + super-res. Our attn_dino accepts any token count via its
-    # Linear(1536 -> inner_dim) projection; the extra tokens give richer
-    # context at the cost of running slightly off training distribution.
+    # Pure MLX DINO at native 518 (1370 tokens). Pool spatial grid from
+    # 37x37 down to 16x16 so the final token count (257) matches what
+    # HF DINOv2 produces at 224 input — the distribution attn_dino's
+    # to_k / to_v were trained against. HF DINO bridge OOMs 32 GB in
+    # both fp32 and fp16.
     dino_in = preprocess_for_dino(ref_u8)
-    dino_feat = model.dino(dino_in)
+    dino_feat = model.dino(dino_in)  # (1, 1370, 1536)
+    # Separate CLS + patch grid, avg-pool 37x37 -> 16x16
+    import math as _math
+    N_full = dino_feat.shape[1] - 1
+    g_old = int(round(_math.sqrt(N_full)))
+    if g_old * g_old == N_full and g_old > 16:
+        cls = dino_feat[:, :1, :]
+        patch = dino_feat[:, 1:, :].reshape(1, g_old, g_old, -1)
+        # Downsample to 16x16 via adaptive average pool (bilinear in MLX)
+        up = nn.Upsample(scale_factor=(16.0 / g_old, 16.0 / g_old),
+                         mode="linear")
+        patch_d = up(patch).reshape(1, 16 * 16, -1)
+        dino_feat = mx.concatenate([cls, patch_d], axis=1)
     dino_proj = model.image_proj(dino_feat)
     mx.synchronize()
 

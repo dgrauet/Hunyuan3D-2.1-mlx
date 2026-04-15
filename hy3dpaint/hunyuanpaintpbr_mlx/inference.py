@@ -18,6 +18,34 @@ from .dino_mlx import preprocess_for_dino
 from .load_model import HunyuanPaintModelMLX, extract_reference_features
 
 
+def _compute_dino_features_hf(model, ref_u8: np.ndarray) -> mx.array:
+    """Run HF DINOv2-giant once on the reference image.
+
+    Caches the model+processor on ``model`` for subsequent calls. Falls
+    back to the pure MLX DINO if HF transformers isn't available.
+    """
+    try:
+        import torch
+        from transformers import AutoImageProcessor, AutoModel
+        from PIL import Image as PILImage
+    except Exception:
+        from .dino_mlx import preprocess_for_dino
+        return model.dino(preprocess_for_dino(ref_u8))
+
+    if not hasattr(model, "_hf_dino_cache"):
+        proc = AutoImageProcessor.from_pretrained("facebook/dinov2-giant")
+        pt_dino = AutoModel.from_pretrained("facebook/dinov2-giant")
+        for p in pt_dino.parameters():
+            p.requires_grad_(False)
+        model._hf_dino_cache = (proc, pt_dino)
+    proc, pt_dino = model._hf_dino_cache
+
+    pt_in = proc(images=PILImage.fromarray(ref_u8), return_tensors="pt")
+    with torch.no_grad():
+        pt_feat = pt_dino(pt_in.pixel_values)[0]
+    return mx.array(pt_feat.numpy())
+
+
 def _cam_mapping(azim: float) -> float:
     """View-dependent guidance scale (per the original pipeline)."""
     azim = azim % 360
@@ -118,9 +146,14 @@ def generate_multiview_pbr(
         ref_u8 = (reference_image * 255).astype(np.uint8)
     else:
         ref_u8 = reference_image
-    dino_in = preprocess_for_dino(ref_u8)
-    dino_feat = model.dino(dino_in)
-    dino_proj = model.image_proj(dino_feat)  # (1, N_tokens, 1024)
+    # Use HF DINOv2 + AutoImageProcessor for exact parity with PT's
+    # training-time feature distribution (224x224 input, 257 tokens).
+    # Our pure MLX DINO at native 518 produced 1370 tokens — out of the
+    # distribution attn_dino's trained to_k / to_v projections expect,
+    # weakening the reference conditioning signal. HF DINO runs once per
+    # generation on CPU in ~1s — acceptable overhead.
+    dino_feat = _compute_dino_features_hf(model, ref_u8)
+    dino_proj = model.image_proj(dino_feat)  # (1, N_tokens * 4, 1024)
     mx.synchronize()
 
     # ------------------------------------------------------------------

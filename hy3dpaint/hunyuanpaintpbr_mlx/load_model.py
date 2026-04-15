@@ -285,9 +285,15 @@ class HunyuanPaintModelMLX:
         del vae_w
 
         # --- DINOv2 ---
+        # Weights ship as fp16. With 40 transformer blocks the per-op
+        # quantisation error accumulates (output diverges ~5x vs fp32 HF on
+        # the same input — measured). Upcast to fp32 for DINO: the model is
+        # small enough (~1.2 GB weights) that the extra memory is fine, and
+        # the reference conditioning quality depends on clean features.
         print("Loading DINOv2...")
         dino = DINOv2MLX()
-        dino_w = dict(mx.load(str(weights_dir / "paint_dino.safetensors")))
+        dino_w = {k: v.astype(mx.float32) for k, v in
+                  mx.load(str(weights_dir / "paint_dino.safetensors")).items()}
         dino.load_weights(list(dino_w.items()))
         del dino_w
 

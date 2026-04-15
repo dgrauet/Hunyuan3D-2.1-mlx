@@ -86,9 +86,13 @@ class ViTBlock(nn.Module):
 
     def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
+        # HF DINOv2 uses layer_norm_eps=1e-6; MLX default is 1e-5. Over 40
+        # blocks the 10x eps discrepancy drives the output to diverge
+        # super-exponentially from HF (measured: block 0 diff 0.04 ->
+        # block 39 diff 435 before the final LayerNorm clips it).
+        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
         self.attn = ViTAttention(dim, num_heads)
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
         # DINOv2 SwiGLU: hidden = dim * 4 * 2/3 (gated), default 0 computes this
         self.mlp = ViTMLP(dim)
         self.layer_scale1 = {"lambda1": mx.ones((dim,))}
@@ -131,12 +135,55 @@ class DINOv2MLX(nn.Module):
 
         self.cls_token = mx.zeros((1, 1, embed_dim))
         self.pos_embed = mx.zeros((1, num_patches + 1, embed_dim))
-        self.norm = nn.LayerNorm(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim, eps=1e-6)
 
         self.blocks = [
             ViTBlock(embed_dim, num_heads, mlp_ratio)
             for _ in range(depth)
         ]
+
+    def _interpolate_pos_embed(self, num_patches_in: int) -> mx.array:
+        """Interpolate pos_embed to match ``num_patches_in`` patches.
+
+        Matches HF DINOv2's ``interpolate_pos_encoding=True`` bicubic
+        resizing with ``antialias=True`` — we run the resize in numpy via
+        scipy so the result is numerically close to HF (MLX has no native
+        bicubic upsampling). Cached so we only pay the cost once.
+        """
+        trained_patches = self.pos_embed.shape[1] - 1
+        if num_patches_in == trained_patches:
+            return self.pos_embed
+
+        cache = getattr(self, "_pos_embed_cache", {})
+        if num_patches_in in cache:
+            return cache[num_patches_in]
+
+        import math
+        import torch
+        import torch.nn.functional as F
+
+        g_old = int(round(math.sqrt(trained_patches)))
+        g_new = int(round(math.sqrt(num_patches_in)))
+        assert g_old * g_old == trained_patches
+        assert g_new * g_new == num_patches_in
+
+        pos_np = np.asarray(self.pos_embed).astype(np.float32)
+        cls_np = pos_np[:, :1, :]
+        patch_np = pos_np[:, 1:, :].reshape(1, g_old, g_old, -1)  # NHWC
+        # Route through PyTorch's F.interpolate(mode="bicubic",
+        # antialias=True) which is what HF DINOv2 uses internally. MLX has
+        # no bicubic upsampling kernel yet, so this one cross-library call
+        # at load time is the easiest way to get bit-close to HF.
+        pt = torch.from_numpy(patch_np).permute(0, 3, 1, 2)  # (1, D, g_old, g_old)
+        pt_new = F.interpolate(
+            pt, size=(g_new, g_new), mode="bicubic", antialias=True,
+            align_corners=False,
+        )
+        patch_new = pt_new.permute(0, 2, 3, 1).numpy().reshape(1, g_new * g_new, -1)
+        new_pos = mx.array(np.concatenate([cls_np, patch_new], axis=1))
+        cache[num_patches_in] = new_pos
+        self._pos_embed_cache = cache
+        return new_pos
 
     def __call__(self, pixel_values: mx.array) -> mx.array:
         """Extract patch features.
@@ -147,13 +194,17 @@ class DINOv2MLX(nn.Module):
         Returns:
             (B, num_patches + 1, embed_dim) features including CLS token.
         """
-        B = pixel_values.shape[0]
+        B, H, W, _ = pixel_values.shape
 
         x = self.patch_embed(pixel_values)  # (B, N, D)
+        N = x.shape[1]
 
         cls = mx.broadcast_to(self.cls_token, (B, 1, self.embed_dim))
         x = mx.concatenate([cls, x], axis=1)  # (B, N+1, D)
-        x = x + self.pos_embed
+
+        # Interpolate the trained pos_embed to match current patch count.
+        pos = self._interpolate_pos_embed(N)
+        x = x + pos
 
         for block in self.blocks:
             x = block(x)
@@ -188,6 +239,17 @@ def preprocess_for_dino(
     image_size: int = 518,
 ) -> mx.array:
     """Preprocess a numpy image for DINOv2.
+
+    Uses 518x518 (the native resolution the checkpoint's pos_embed is
+    trained for). PT's AutoImageProcessor default is 224x224, which
+    requires interpolating pos_embed and introduces numerical drift that
+    amplifies super-exponentially over the 40 ViT blocks (we measured
+    mean_rel ~130% on the final features vs HF at 224, vs ~2% at 518).
+
+    ImageProjModel downstream handles the 5.3x more tokens (1370 vs 257)
+    correctly — it's a per-token Linear projection. attn_dino in the
+    main UNet cross-attends to whatever tokens we provide; more tokens
+    give finer spatial detail for reference conditioning.
 
     Args:
         image_np: (H, W, 3) uint8 or float32 image.

@@ -19,31 +19,40 @@ from .load_model import HunyuanPaintModelMLX, extract_reference_features
 
 
 def _compute_dino_features_hf(model, ref_u8: np.ndarray) -> mx.array:
-    """Run HF DINOv2-giant once on the reference image.
+    """Run HF DINOv2-giant once on the reference image, then free it.
 
-    Caches the model+processor on ``model`` for subsequent calls. Falls
-    back to the pure MLX DINO if HF transformers isn't available.
+    Using HF directly (torch on CPU) gives bit-exact parity with PT's
+    training-time feature distribution (224x224 input, 257 tokens).
+    Loading both MLX DINO and HF DINO simultaneously OOMs on 32 GB
+    unified memory, so we free the MLX DINO here and release HF once
+    features are computed.
     """
     try:
         import torch
+        import gc as _gc
         from transformers import AutoImageProcessor, AutoModel
         from PIL import Image as PILImage
     except Exception:
         from .dino_mlx import preprocess_for_dino
         return model.dino(preprocess_for_dino(ref_u8))
 
-    if not hasattr(model, "_hf_dino_cache"):
-        proc = AutoImageProcessor.from_pretrained("facebook/dinov2-giant")
-        pt_dino = AutoModel.from_pretrained("facebook/dinov2-giant")
-        for p in pt_dino.parameters():
-            p.requires_grad_(False)
-        model._hf_dino_cache = (proc, pt_dino)
-    proc, pt_dino = model._hf_dino_cache
+    # Free the MLX DINO (we won't need it this run — HF is authoritative).
+    if getattr(model, "dino", None) is not None:
+        model.dino = None
+        _gc.collect()
 
+    proc = AutoImageProcessor.from_pretrained("facebook/dinov2-giant")
+    pt_dino = AutoModel.from_pretrained("facebook/dinov2-giant")
+    for p in pt_dino.parameters():
+        p.requires_grad_(False)
     pt_in = proc(images=PILImage.fromarray(ref_u8), return_tensors="pt")
     with torch.no_grad():
         pt_feat = pt_dino(pt_in.pixel_values)[0]
-    return mx.array(pt_feat.numpy())
+
+    out = mx.array(pt_feat.numpy())
+    del proc, pt_dino, pt_in, pt_feat
+    _gc.collect()
+    return out
 
 
 def _cam_mapping(azim: float) -> float:

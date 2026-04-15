@@ -331,7 +331,7 @@ class BasicTransformerBlock(nn.Module):
                 ref_out_flat = ref_out_full.reshape(B_total, L, C)
                 hidden_states = hidden_states + ref_out_flat
 
-        # --- Step 3: Multiview attention ---
+        # --- Step 3: Multiview attention (with optional 3D RoPE) ---
         if has_25d and n_views > 1:
             B_total, L, C = hidden_states.shape
             B_mat = B_total // n_views  # B * n_pbr
@@ -339,7 +339,42 @@ class BasicTransformerBlock(nn.Module):
 
             # Reshape to concat views: (B*n_pbr, n_views*L, C)
             mv_input = norm_hs.reshape(B_mat, n_views * L, C)
-            mv_out = self.attn_multiview(mv_input)
+
+            # Optional 3D RoPE (matches PT's PoseRoPEAttnProcessor):
+            # position_voxel_indices is a dict keyed by sequence length L
+            # produced by calc_multires_voxel_indices on the raw position maps.
+            position_voxel_indices = kwargs.get("position_voxel_indices")
+            pos_idx_dict = None
+            if position_voxel_indices is not None and L in position_voxel_indices:
+                pos_idx_dict = position_voxel_indices[L]
+
+            if pos_idx_dict is not None:
+                from .attn_processor_mlx import RotaryEmbedding
+                attn = self.attn_multiview
+                heads = attn.heads
+                head_dim = attn.dim_head
+
+                def _split_heads(t):
+                    B, NL, C = t.shape
+                    return t.reshape(B, NL, heads, head_dim).transpose(0, 2, 1, 3)
+
+                q = _split_heads(attn.to_q(mv_input))
+                k = _split_heads(attn.to_k(mv_input))
+                v = _split_heads(attn.to_v(mv_input))
+
+                vi = pos_idx_dict["voxel_indices"]
+                vr = pos_idx_dict["voxel_resolution"]
+                cos, sin = RotaryEmbedding.get_3d_rotary_pos_embed(vi, head_dim, vr)
+                q = RotaryEmbedding.apply_rotary_emb(q, (cos, sin))
+                k = RotaryEmbedding.apply_rotary_emb(k, (cos, sin))
+
+                scores = (q @ k.transpose(0, 1, 3, 2)) * (head_dim ** -0.5)
+                attn_w = mx.softmax(scores, axis=-1)
+                mv_out = (attn_w @ v).transpose(0, 2, 1, 3).reshape(B_mat, n_views * L, C)
+                mv_out = attn.to_out(mv_out)
+            else:
+                mv_out = self.attn_multiview(mv_input)
+
             mv_out = mv_out.reshape(B_total, L, C)
             hidden_states = mv_out + hidden_states
 

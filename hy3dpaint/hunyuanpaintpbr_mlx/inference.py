@@ -90,6 +90,22 @@ def generate_multiview_pbr(
     z_pos = encode_images(position_maps)    # (N, h, w, 4)
     mx.synchronize()
 
+    # Multi-resolution voxel indices for 3D RoPE in multiview attention.
+    # Built from the raw position maps (NOT the VAE-encoded latents).
+    from .unet.voxel_indices import calc_multires_voxel_idxs
+    pos_resized = []
+    for pm in position_maps:
+        if pm.dtype == np.uint8:
+            pm = pm.astype(np.float32) / 255.0
+        from PIL import Image as PILImage
+        pil = PILImage.fromarray((pm * 255).astype(np.uint8)).resize(
+            (view_size, view_size)
+        )
+        pos_resized.append(np.array(pil).astype(np.float32) / 255.0)
+    # (N, H, W, 3) -> (1, N, 3, H, W)
+    pos_np = np.stack(pos_resized).transpose(0, 3, 1, 2)[None]
+    voxel_indices = calc_multires_voxel_idxs(pos_np)
+
     # ------------------------------------------------------------------
     # 2. DINO features
     # ------------------------------------------------------------------
@@ -177,9 +193,12 @@ def generate_multiview_pbr(
     for i, t in enumerate(model.scheduler.timesteps):
         t_int = int(t)
 
-        # Process views in chunks to fit in memory
-        # Each chunk: a few views × n_pbr samples, 3 CFG passes
-        chunk_size = 1  # 1 view at a time (64 heads × 4096 tokens needs ~4GB per sample)
+        # Process all views together so that the multi-view attention
+        # (which needs n_views > 1 to fire) can share information across
+        # views. With chunk_size=1 the multiview attention path is silently
+        # disabled and each view denoises independently — that's what was
+        # producing inconsistent colors at view boundaries.
+        chunk_size = n_views
         t_arr = mx.array([t_int])
         noise_guided = mx.zeros_like(latents)
 
@@ -214,15 +233,34 @@ def generate_multiview_pbr(
             # Earlier we passed DINO to BOTH ref and full, making
             # (full - ref) ~= 0 and dropping half of the guidance.
 
+            # Slice voxel indices to the current chunk's views
+            chunk_view_ids = list(range(v_start, v_end))
+            chunk_voxel = {}
+            for seq_len, vd in voxel_indices.items():
+                vi_full = vd["voxel_indices"]  # (1, n_views * GxG, 3)
+                gxg = vi_full.shape[1] // n_views
+                # Pick this chunk's views
+                vi_per_view = vi_full.reshape(1, n_views, gxg, 3)
+                vi_chunk = vi_per_view[:, mx.array(chunk_view_ids), :, :]
+                vi_chunk = vi_chunk.reshape(1, len(chunk_view_ids) * gxg, 3)
+                chunk_voxel[len(chunk_view_ids) * gxg] = {
+                    "voxel_indices": vi_chunk,
+                    "voxel_resolution": vd["voxel_resolution"],
+                }
+
             # uncond: no DINO, no ref features, neg text
             pred_uncond = model.unet(
                 unet_in, t_arr, text_neg_c,
                 n_views=n_chunk, n_pbr=n_pbr,
+                position_voxel_indices=chunk_voxel,
             )
             mx.synchronize()
 
             # ref: ref_features ON, DINO OFF, pos text
-            ctx_ref = dict(n_views=n_chunk, n_pbr=n_pbr)
+            ctx_ref = dict(
+                n_views=n_chunk, n_pbr=n_pbr,
+                position_voxel_indices=chunk_voxel,
+            )
             if ref_features is not None:
                 ctx_ref["ref_features"] = ref_features
             pred_ref = model.unet(unet_in, t_arr, text_full_c, **ctx_ref)
@@ -232,6 +270,7 @@ def generate_multiview_pbr(
             ctx_full = dict(
                 n_views=n_chunk, n_pbr=n_pbr,
                 dino_features=dino_c,
+                position_voxel_indices=chunk_voxel,
             )
             if ref_features is not None:
                 ctx_full["ref_features"] = ref_features

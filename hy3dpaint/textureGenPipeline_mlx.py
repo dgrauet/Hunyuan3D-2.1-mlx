@@ -376,6 +376,13 @@ class Hunyuan3DPaintPipelineMLX:
 
         if save_glb:
             glb_path = output_mesh_path.replace(".obj", ".glb")
-            _convert_obj_to_glb(output_mesh_path, glb_path)
+            # Export directly from the in-memory trimesh so the PBRMaterial
+            # (metallicRoughnessTexture, doubleSided, sRGB baseColor) is
+            # preserved. OBJ round-trip would drop all of it.
+            in_mem = getattr(self.render, "_last_exported_mesh", None)
+            if in_mem is not None:
+                in_mem.export(glb_path)
+            else:
+                _convert_obj_to_glb(output_mesh_path, glb_path)
 
         return output_mesh_path

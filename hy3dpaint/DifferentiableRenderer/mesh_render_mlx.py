@@ -549,6 +549,11 @@ class MeshRenderMLX:
             mesh.visual = visuals
 
         mesh.export(mesh_path)
+        # Expose the in-memory trimesh so callers can export GLB directly.
+        # Going OBJ -> trimesh.load -> GLB would drop the PBRMaterial
+        # (OBJ/MTL can't carry metallicRoughnessTexture, doubleSided, or
+        # sRGB hints) and silently erase our PBR work.
+        self._last_exported_mesh = mesh
 
     # ------------------------------------------------------------------
     # Texture-space operations

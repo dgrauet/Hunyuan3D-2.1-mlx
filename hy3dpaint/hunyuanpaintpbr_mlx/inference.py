@@ -146,14 +146,15 @@ def generate_multiview_pbr(
         ref_u8 = (reference_image * 255).astype(np.uint8)
     else:
         ref_u8 = reference_image
-    # Use HF DINOv2 + AutoImageProcessor for exact parity with PT's
-    # training-time feature distribution (224x224 input, 257 tokens).
-    # Our pure MLX DINO at native 518 produced 1370 tokens — out of the
-    # distribution attn_dino's trained to_k / to_v projections expect,
-    # weakening the reference conditioning signal. HF DINO runs once per
-    # generation on CPU in ~1s — acceptable overhead.
-    dino_feat = _compute_dino_features_hf(model, ref_u8)
-    dino_proj = model.image_proj(dino_feat)  # (1, N_tokens * 4, 1024)
+    # Pure MLX DINO at native 518 (1370 tokens). HF DINO would give
+    # bit-exact PT parity (224 input, 257 tokens) but co-loading both
+    # plus the paint UNet + dual UNet + VAE OOMs 32 GB unified memory.
+    # Our attn_dino down the line is a Linear(1536 -> inner_dim) that
+    # consumes any token count — the extra tokens give richer context
+    # at the cost of running off the training distribution.
+    dino_in = preprocess_for_dino(ref_u8)
+    dino_feat = model.dino(dino_in)
+    dino_proj = model.image_proj(dino_feat)
     mx.synchronize()
 
     # ------------------------------------------------------------------

@@ -521,8 +521,12 @@ class MeshRenderMLX:
                 baseColorTexture=tex_img,
                 metallicFactor=0.0,
                 roughnessFactor=1.0,
-                doubleSided=True,
             )
+            # trimesh's PBRMaterial doesn't accept doubleSided as a
+            # constructor kwarg in all versions — set it as an attribute
+            # so the GLB export flags the material accordingly. Backface
+            # culling was making silhouettes see-through on the mesh.
+            material.doubleSided = True
             visuals = trimesh.visual.TextureVisuals(
                 uv=vtx_uv, material=material,
             )

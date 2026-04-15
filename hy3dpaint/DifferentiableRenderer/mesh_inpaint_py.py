@@ -252,7 +252,7 @@ def mesh_vertex_inpaint(
             tex, msk,
             vtx_uv[u0], vtx_uv[u1], vtx_uv[u2],
             vtx_color[v0], vtx_color[v1], vtx_color[v2],
-            margin=2.0,
+            margin=4.0,
         )
 
     return tex, msk

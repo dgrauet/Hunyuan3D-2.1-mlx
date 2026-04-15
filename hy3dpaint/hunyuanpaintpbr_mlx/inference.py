@@ -163,7 +163,12 @@ def generate_multiview_pbr(
     # Per-material learned tokens
     text_albedo = model.learned_text_clip["albedo"]  # (77, 1024)
     text_mr = model.learned_text_clip["mr"]
-    text_neg = mx.zeros_like(text_albedo)
+    # PT (pipeline.py:275) sets ``negative_prompt_embeds = prompt_embeds``
+    # when use_learned_text_clip is True — the uncond batch reuses the
+    # SAME learned material tokens, not zeros. CFG signal then comes
+    # from ref_features/DINO presence, not from text. Using zeros here
+    # was pushing the uncond prediction off-distribution and weakening
+    # the guidance.
 
     # ------------------------------------------------------------------
     # 2b. Reference features — capture norm_hidden_states from each
@@ -191,7 +196,8 @@ def generate_multiview_pbr(
         mx.broadcast_to(text_mr[None], (n_views, 77, 1024)),
     ], axis=0)  # (N_pbr*N_views, 77, 1024) = (12, 77, 1024)
 
-    text_neg_batch = mx.broadcast_to(text_neg[None], (n_pbr * n_views, 77, 1024))
+    # Negative and positive text batches are identical (PT pipeline.py:275).
+    text_neg_batch = text_full
 
     # CFG triple: [negative, ref(=full), full]
     text_cfg = mx.concatenate([text_neg_batch, text_full, text_full], axis=0)

@@ -151,13 +151,14 @@ def generate_multiview_pbr(
         ref_u8 = (reference_image * 255).astype(np.uint8)
     else:
         ref_u8 = reference_image
-    # Use HF DINOv2 (fp16, CPU) for exact PT-parity 257-token output.
-    # Freeing MLX DINO before HF loads to fit in 32 GB unified memory.
-    if getattr(model, "dino", None) is not None:
-        model.dino = None
-        import gc as _gc
-        _gc.collect()
-    dino_feat = _compute_dino_features_hf(model, ref_u8)
+    # Pure MLX DINO at native 518 (1370 tokens). HF DINO bridge for
+    # PT-exact 257 tokens was tried in fp32 AND fp16 — both OOM 32 GB
+    # unified memory when co-resident with the paint UNet + dual UNet
+    # + VAE + super-res. Our attn_dino accepts any token count via its
+    # Linear(1536 -> inner_dim) projection; the extra tokens give richer
+    # context at the cost of running slightly off training distribution.
+    dino_in = preprocess_for_dino(ref_u8)
+    dino_feat = model.dino(dino_in)
     dino_proj = model.image_proj(dino_feat)
     mx.synchronize()
 

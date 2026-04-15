@@ -197,14 +197,12 @@ def generate_multiview_pbr(
     for i, t in enumerate(model.scheduler.timesteps):
         t_int = int(t)
 
-        # Multiview attention with all views in a single forward and 3D RoPE
-        # is the most PT-faithful path but produces visibly degraded output
-        # in MLX (suspected mx.fast.scaled_dot_product_attention numerical
-        # behaviour at L=24k tokens with rotated Q/K). chunk_size=1 keeps
-        # multiview attention disabled (n_views=1 in kwargs) and lets each
-        # view denoise with reference + DINO + cross-attn only — visibly
-        # cleaner per-view output and the WTA bake then enforces inter-view
-        # consistency at texel level.
+        # Process all n_views in a single forward so the multiview
+        # attention path inside BasicTransformerBlock fires (it guards on
+        # n_views > 1). Combined with the 3D RoPE positional encoding
+        # from calc_multires_voxel_idxs and the norm_hs-reuse fix, the
+        # cross-view consistency this provides is a big part of matching
+        # PT's output.
         chunk_size = n_views
         t_arr = mx.array([t_int])
         noise_guided = mx.zeros_like(latents)

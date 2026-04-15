@@ -516,16 +516,32 @@ class MeshRenderMLX:
             # GLB viewers assumed the texture was linear, applying an
             # unwanted gamma curve that darkened / desaturated the mesh
             # relative to the atlas PNG.
-            material = trimesh.visual.material.PBRMaterial(
+            mr_tex_img = None
+            mr_atlas = getattr(self, "tex_mr", None)
+            if mr_atlas is not None:
+                # glTF packs metallic in B, roughness in G (R unused).
+                # Our MR atlas comes from the diffusion MR material and
+                # has the right channel layout from the PT pipeline's
+                # back-projection: albedo not used in MR view.
+                mr_u8 = (np.clip(mr_atlas, 0, 1) * 255).astype(np.uint8)
+                if mr_u8.ndim == 2:
+                    mr_u8 = np.stack([mr_u8, mr_u8, mr_u8], axis=-1)
+                mr_tex_img = PILImage.fromarray(mr_u8)
+
+            kwargs = dict(
                 name="paint_pbr",
                 baseColorTexture=tex_img,
-                metallicFactor=0.0,
-                roughnessFactor=1.0,
             )
-            # trimesh's PBRMaterial doesn't accept doubleSided as a
-            # constructor kwarg in all versions — set it as an attribute
-            # so the GLB export flags the material accordingly. Backface
-            # culling was making silhouettes see-through on the mesh.
+            if mr_tex_img is not None:
+                kwargs["metallicRoughnessTexture"] = mr_tex_img
+                kwargs["metallicFactor"] = 1.0
+                kwargs["roughnessFactor"] = 1.0
+            else:
+                kwargs["metallicFactor"] = 0.0
+                kwargs["roughnessFactor"] = 1.0
+            material = trimesh.visual.material.PBRMaterial(**kwargs)
+            # doubleSided stops backface culling that was making the
+            # silhouettes see-through.
             material.doubleSided = True
             visuals = trimesh.visual.TextureVisuals(
                 uv=vtx_uv, material=material,

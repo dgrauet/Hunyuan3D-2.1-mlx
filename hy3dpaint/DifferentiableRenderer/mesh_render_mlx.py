@@ -511,7 +511,18 @@ class MeshRenderMLX:
             tex_img = PILImage.fromarray(
                 (np.clip(texture, 0, 1) * 255).astype(np.uint8)
             )
-            material = trimesh.visual.texture.SimpleMaterial(image=tex_img)
+            # Use PBRMaterial so GLB exports tag the baseColorTexture as
+            # sRGB. SimpleMaterial doesn't carry color-space metadata and
+            # GLB viewers assumed the texture was linear, applying an
+            # unwanted gamma curve that darkened / desaturated the mesh
+            # relative to the atlas PNG.
+            material = trimesh.visual.material.PBRMaterial(
+                name="paint_pbr",
+                baseColorTexture=tex_img,
+                metallicFactor=0.0,
+                roughnessFactor=1.0,
+                doubleSided=True,
+            )
             visuals = trimesh.visual.TextureVisuals(
                 uv=vtx_uv, material=material,
             )

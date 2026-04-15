@@ -342,12 +342,16 @@ class BasicTransformerBlock(nn.Module):
             mv_input = norm_hs.reshape(B_mat, n_views * L, C)
 
             # Optional 3D RoPE (matches PT's PoseRoPEAttnProcessor):
-            # position_voxel_indices is a dict keyed by sequence length L
-            # produced by calc_multires_voxel_indices on the raw position maps.
+            # position_voxel_indices is keyed by the MULTIVIEW seq length
+            # (n_views * L), not the per-view L (PT modules.py:618 uses
+            # multivew_hidden_states.shape[1]). Without this lookup the
+            # RoPE never fired and the model — trained with RoPE — output
+            # garbage when multiview attention was active.
+            mv_seq_len = n_views * L
             position_voxel_indices = kwargs.get("position_voxel_indices")
             pos_idx_dict = None
-            if position_voxel_indices is not None and L in position_voxel_indices:
-                pos_idx_dict = position_voxel_indices[L]
+            if position_voxel_indices is not None and mv_seq_len in position_voxel_indices:
+                pos_idx_dict = position_voxel_indices[mv_seq_len]
 
             if pos_idx_dict is not None:
                 from .attn_processor_mlx import RotaryEmbedding

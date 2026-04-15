@@ -157,12 +157,13 @@ class Attention(nn.Module):
 
         q, k, v = reshape_heads(q), reshape_heads(k), reshape_heads(v)
 
-        # Scaled dot-product attention
-        scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale
-        attn = mx.softmax(scores, axis=-1)
-        out = attn @ v
+        # Use the fused flash-attention kernel — explicit softmax(QK^T)V
+        # builds a (L, L_ctx) scores tensor per head per layer and blows
+        # past unified-memory limits when L is large (multiview attention
+        # at 6 views * 4096 tokens = 24k).
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
 
-        # Reshape back: (B, H, L, D) → (B, L, H*D)
+        # Reshape back: (B, H, L, D) -> (B, L, H*D)
         out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.to_out(out)
 
@@ -368,9 +369,15 @@ class BasicTransformerBlock(nn.Module):
                 q = RotaryEmbedding.apply_rotary_emb(q, (cos, sin))
                 k = RotaryEmbedding.apply_rotary_emb(k, (cos, sin))
 
-                scores = (q @ k.transpose(0, 1, 3, 2)) * (head_dim ** -0.5)
-                attn_w = mx.softmax(scores, axis=-1)
-                mv_out = (attn_w @ v).transpose(0, 2, 1, 3).reshape(B_mat, n_views * L, C)
+                # Use mx.fast.scaled_dot_product_attention for memory-
+                # efficient flash-attention style fused kernel (the multiview
+                # seq_len = n_views * L can be 6*4096 = 24k tokens; the
+                # explicit softmax(QK^T)V allocates a 24k*24k matrix per
+                # head per layer and OOMs on M-series unified memory).
+                mv_out = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=head_dim ** -0.5,
+                )
+                mv_out = mv_out.transpose(0, 2, 1, 3).reshape(B_mat, n_views * L, C)
                 mv_out = attn.to_out(mv_out)
             else:
                 mv_out = self.attn_multiview(mv_input)

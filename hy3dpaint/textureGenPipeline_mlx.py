@@ -248,12 +248,15 @@ class Hunyuan3DPaintPipelineMLX:
             output_mesh_path = os.path.join(path, "textured_mesh.obj")
 
         mesh = trimesh.load(processed_mesh_path)
-        # Only UV-wrap if the mesh lacks UVs or xatlas is forced
-        needs_wrap = True
-        if isinstance(mesh, trimesh.Trimesh):
-            uv = getattr(getattr(mesh, "visual", None), "uv", None)
-            if uv is not None and len(uv) > 0:
-                needs_wrap = False
+        # trimesh.load can return a Scene for .glb/.gltf; flatten to a single
+        # Trimesh so we can inspect UVs (a Scene wrapper hides them).
+        if isinstance(mesh, trimesh.Scene):
+            mesh = mesh.dump(concatenate=True)
+
+        # Only UV-wrap if the mesh has no UVs (xatlas creates fragmented
+        # islands; a hand-authored UV layout produces much cleaner textures).
+        uv = getattr(getattr(mesh, "visual", None), "uv", None)
+        needs_wrap = uv is None or len(uv) == 0
         if needs_wrap:
             if mesh_uv_wrap is None:
                 raise RuntimeError(

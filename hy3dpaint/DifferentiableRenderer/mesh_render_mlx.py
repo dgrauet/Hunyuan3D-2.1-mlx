@@ -892,29 +892,30 @@ class MeshRenderMLX:
 
         return self.fast_bake_texture(textures, cos_maps)
 
-    def uv_inpaint(self, texture, mask, method="NS", vertex_inpaint=True):
+    def uv_inpaint(self, texture, mask, method="edt", vertex_inpaint=True):
         """Inpaint missing regions in UV texture.
 
-        The PyTorch pipeline does this in two passes:
-          1. Mesh-aware vertex-color propagation (fills most of the gaps
-             between UV islands using the underlying 3D adjacency).
-          2. cv2.inpaint for the remaining small gaps.
+        Two-pass pipeline matching PyTorch's bake flow:
+          1. Mesh-aware vertex-color propagation + face-bary rasterization
+             (fills most of the UV islands using 3D adjacency).
+          2. Gutter fill for the remaining empty texels.
 
-        Skipping step 1 makes step 2 hallucinate across massive UV-island
-        boundaries and produces noisy, fragmented output on any non-trivial
-        mesh — exactly what we were seeing on the mermaid test.
+        For step 2 the default ``"edt"`` mode copies each gutter texel from
+        its nearest painted texel via ``scipy.ndimage.distance_transform_edt``.
+        It's deterministic and never blends colors across distant UV islands —
+        unlike ``"NS"`` (cv2.INPAINT_NS) which diffuses and tends to mix
+        unrelated islands together when they happen to be 2D-close in atlas
+        space.
 
         Args:
             texture: (H, W, C) numpy array in [0, 1].
             mask: (H, W) or (H, W, 1) numpy uint8, 255=keep, 0=inpaint.
-            method: "NS" for Navier-Stokes (cv2.INPAINT_NS).
+            method: "edt" (default, EDT nearest-fill) or "NS" (cv2 NS).
             vertex_inpaint: Run the mesh-aware propagation pass first.
 
         Returns:
             (H, W, C) numpy uint8 array.
         """
-        import cv2
-
         if isinstance(texture, mx.array):
             texture = np.array(texture)
 
@@ -927,14 +928,24 @@ class MeshRenderMLX:
 
         if vertex_inpaint and self.vtx_uv is not None and self.uv_idx is not None:
             from .mesh_inpaint_py import mesh_vertex_inpaint
-            vtx_pos_np = np.asarray(self.vtx_pos)
-            vtx_uv_np = np.asarray(self.vtx_uv)
-            pos_idx_np = np.asarray(self.pos_idx)
-            uv_idx_np = np.asarray(self.uv_idx)
             tex_f, mask = mesh_vertex_inpaint(
-                tex_f, mask, vtx_pos_np, vtx_uv_np, pos_idx_np, uv_idx_np,
+                tex_f, mask,
+                np.asarray(self.vtx_pos), np.asarray(self.vtx_uv),
+                np.asarray(self.pos_idx), np.asarray(self.uv_idx),
             )
 
+        if method == "edt":
+            from scipy.ndimage import distance_transform_edt
+            painted = mask > 0
+            if painted.any():
+                idx = distance_transform_edt(
+                    ~painted, return_distances=False, return_indices=True,
+                )
+                tex_f = tex_f[idx[0], idx[1]]
+            return (np.clip(tex_f, 0, 1) * 255).astype(np.uint8)
+
+        # Fallback: cv2.INPAINT_NS (mixes colors across UV gutters; can produce
+        # rainbow noise when UV islands are highly fragmented).
+        import cv2
         texture_u8 = (np.clip(tex_f, 0, 1) * 255).astype(np.uint8)
-        result = cv2.inpaint(texture_u8, 255 - mask, 3, cv2.INPAINT_NS)
-        return result
+        return cv2.inpaint(texture_u8, 255 - mask, 3, cv2.INPAINT_NS)

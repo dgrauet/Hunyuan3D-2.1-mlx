@@ -89,9 +89,18 @@ Stage 2 (paint) adds ~6 GB peak for the UNet + VAE + DINOv2 at fp32.
 
 ### Scope
 
-- ✅ Stage 1 (shape generation): fully ported to MLX
-- ✅ Stage 2 (PBR texture synthesis): fully ported to MLX — rasterizer (Metal), UNet 2.5D with dual-stream reference attention, VAE, DINOv2, scheduler, back-projection bake, UV inpaint
-- ⚠️ RealESRGAN super-resolution pass (between diffusion and bake) is optional and not yet ported — output is 512² per view instead of 2048² on the PyTorch path
+- ✅ **Stage 1** (shape generation): fully ported to MLX, validated numerically against PyTorch (1e-5)
+- ✅ **Stage 2** (PBR texture synthesis): fully ported to MLX, full UNet match within 1.17e-5 vs PyTorch
+  - Metal rasterizer, UNet 2.5D with dual-stream reference attention, VAE, DINOv2, v_prediction scheduler
+  - **Per-face WTA bake merge** (winner-takes-all per UV face) eliminates the rainbow speckles that cosine-weighted averaging produces from slightly-divergent multi-view diffusion outputs
+  - **Mesh-aware vertex-color propagation + face barycentric raster** fills UV islands; gutter completed by EDT nearest-fill (no cv2.inpaint cross-island bleed)
+  - **RealESRGAN x4 super-resolution** in MLX (512² → 2048² per view before bake)
+
+### Texture quality notes
+
+- Reference image must match the mesh content (e.g. mermaid image on mermaid mesh). Cross-pairing produces fragmented atlases since the diffusion's albedo views can't coherently project onto an unrelated 3D layout.
+- Front views of meshes with highly-fragmented UV layouts on detailed regions (e.g. faces) may show transitions where adjacent UV islands' best views differ. Meshes with simpler UV layouts (case_1 fox) render cleanly across all 6 azimuths.
+- Tested on `assets/case_1/mesh.glb` (fox, all 6 views clean) and `assets/case_2/mesh.glb` (mermaid, 4/6 views clean).
 
 ---
 

@@ -1046,8 +1046,23 @@ class MeshRenderMLX:
                 tex_f = tex_f[idx[0], idx[1]]
             return (np.clip(tex_f, 0, 1) * 255).astype(np.uint8)
 
-        # Fallback: cv2.INPAINT_NS (mixes colors across UV gutters; can produce
-        # rainbow noise when UV islands are highly fragmented).
+        # cv2.INPAINT_NS for near-field fill (PT parity), then an explicit
+        # EDT edge-padding pass for UV gutter. NS's 3-px radius is smaller
+        # than typical UV-island spacing in a 2048^2 atlas, so 3D viewers
+        # doing bilinear texture sampling across island boundaries read
+        # the NS-smoothed (near-black) gutter and display thin wireframe
+        # lines on the mesh. EDT pads every unpainted texel with the
+        # nearest painted color — this is the standard post-bake step in
+        # production UV pipelines and never affects texels that are
+        # visible in 3D (painted).
         import cv2
+        from scipy.ndimage import distance_transform_edt
         texture_u8 = (np.clip(tex_f, 0, 1) * 255).astype(np.uint8)
-        return cv2.inpaint(texture_u8, 255 - mask, 3, cv2.INPAINT_NS)
+        inpainted = cv2.inpaint(texture_u8, 255 - mask, 3, cv2.INPAINT_NS)
+        painted = mask > 0
+        if painted.any() and (~painted).any():
+            idx = distance_transform_edt(
+                ~painted, return_distances=False, return_indices=True,
+            )
+            inpainted = inpainted[idx[0], idx[1]]
+        return inpainted

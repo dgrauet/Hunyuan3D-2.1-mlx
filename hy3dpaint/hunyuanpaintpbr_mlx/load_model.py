@@ -332,8 +332,11 @@ class HunyuanPaintModelMLX:
 
         matched = [(k, v) for k, v in normalized.items() if k in model_keys]
         unet.load_weights(matched)
+        # The remaining keys in `stripped` (learned_text_clip_* and
+        # image_proj_model_dino.*) belong to separate modules and are
+        # consumed below — they are not truly "unmatched".
         print(f"  Loaded {len(matched)}/{len(stripped)} main UNet weights"
-              f" ({len(stripped) - len(matched)} unmatched)")
+              f" (remaining keys load into text embeds + DINO proj below)")
 
         # --- Learned text embeddings ---
         learned = {}

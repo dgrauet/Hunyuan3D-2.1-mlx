@@ -44,7 +44,7 @@ def main() -> None:
 
     # Lower render/texture size for speed on laptop. The default (2048 render,
     # 4096 texture) is fine on a beefier box.
-    cfg = Hunyuan3DPaintConfigMLX(max_num_view=6, resolution=512)
+    cfg = Hunyuan3DPaintConfigMLX(max_num_view=8, resolution=512)
     cfg.render_size = 1024
     cfg.texture_size = 2048
     cfg.use_mlx_diffusion = True

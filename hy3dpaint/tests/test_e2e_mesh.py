@@ -42,16 +42,12 @@ def main() -> None:
         Hunyuan3DPaintPipelineMLX,
     )
 
-    # Lower render/texture size for speed on laptop. The default (2048 render,
-    # 4096 texture) is fine on a beefier box.
-    cfg = Hunyuan3DPaintConfigMLX(max_num_view=8, resolution=512)
-    cfg.render_size = 1024
-    cfg.texture_size = 2048
+    # PT reference defaults (demo.py + pipeline.py): max_num_view=6,
+    # resolution=512, render_size=2048, texture_size=4096,
+    # num_inference_steps=15, guidance_scale=3.0. Do NOT tune these —
+    # drifting from PT defaults masks port bugs behind config changes.
+    cfg = Hunyuan3DPaintConfigMLX(max_num_view=6, resolution=512)
     cfg.use_mlx_diffusion = True
-    # PT uses 15 UniPC steps. Tested 25 DDIM steps: marginal visual
-    # improvement for ~70% extra runtime. Quality is now limited by
-    # 2.5D path numerical divergence, not denoising step count.
-    cfg.mlx_num_inference_steps = 15
 
     print("[1/2] Building pipeline...")
     t0 = time.time()

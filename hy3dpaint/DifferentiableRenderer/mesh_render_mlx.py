@@ -876,20 +876,17 @@ class MeshRenderMLX:
             boundary_map.reshape(th, tw, 1),
         )
 
-    def fast_bake_texture(self, textures, cos_maps, mode="face_wta"):
+    def fast_bake_texture(self, textures, cos_maps, mode="weighted"):
         """Merge multiple view textures into a single UV atlas.
 
-        Three modes:
-          - ``"face_wta"`` (default): pick one view per UV face (the view
-            with the highest summed cos over the face's texels) and bake
-            the entire face from that view. Eliminates the intra-island
-            color stripes that per-texel WTA produces when neighboring
-            texels of the same face/island fall to different "best" views.
-          - ``"wta"``: per-texel argmax of weighted cos. Faster but can
-            produce visible stripes within a single UV island.
-          - ``"weighted"`` (PyTorch parity): cosine-weighted average of all
-            views. Mixes slightly-different per-view colors and tends to
-            produce rainbow speckles on multi-view-covered regions.
+        Three modes (PT parity is default):
+          - ``"weighted"`` (default, PyTorch parity): cosine-weighted
+            average of all views. Smooth across face boundaries; matches
+            MeshRender.fast_bake_texture exactly.
+          - ``"face_wta"``: pick one view per UV face. Sharper but creates
+            visible discontinuities at mesh-face seams where adjacent
+            faces pick different winning views.
+          - ``"wta"``: per-texel argmax. Fastest, stripiest.
 
         Args:
             textures: list of (H, W, C) numpy arrays.
@@ -997,7 +994,7 @@ class MeshRenderMLX:
 
         return self.fast_bake_texture(textures, cos_maps)
 
-    def uv_inpaint(self, texture, mask, method="edt", vertex_inpaint=True):
+    def uv_inpaint(self, texture, mask, method="NS", vertex_inpaint=True):
         """Inpaint missing regions in UV texture.
 
         Two-pass pipeline matching PyTorch's bake flow:

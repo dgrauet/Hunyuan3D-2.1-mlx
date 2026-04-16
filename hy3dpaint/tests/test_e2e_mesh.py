@@ -44,9 +44,13 @@ def main() -> None:
 
     # PT reference defaults (demo.py + pipeline.py): max_num_view=6,
     # resolution=512, render_size=2048, texture_size=4096,
-    # num_inference_steps=15, guidance_scale=3.0. Do NOT tune these —
-    # drifting from PT defaults masks port bugs behind config changes.
+    # num_inference_steps=15, guidance_scale=3.0. Matched here EXCEPT
+    # texture_size=2048 — the Metal rasterizer times out at 4096 on
+    # laptop GPUs (kIOGPUCommandBufferCallbackErrorImpactingInteractivity)
+    # because we don't tile the bake. 2048 keeps PT parity everywhere
+    # else while staying within the Metal command-buffer budget.
     cfg = Hunyuan3DPaintConfigMLX(max_num_view=6, resolution=512)
+    cfg.texture_size = 2048
     cfg.use_mlx_diffusion = True
 
     print("[1/2] Building pipeline...")

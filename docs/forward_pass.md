@@ -115,9 +115,9 @@ unified memory.
                               │
                               ▼
                 ┌────────────────────────────────────────┐
-                │  fast_bake_texture (mode="face_wta")    │
-                │  per UV face → pick view with max sum   │
-                │  of cos over face's texels              │
+                │  fast_bake_texture (mode="weighted")    │
+                │  cosine-weighted blend across all views │
+                │  (matches PT MeshRender.fast_bake_texture)│
                 │  → atlas (2048, 2048, 3) + trust mask   │
                 └─────────────┬──────────────────────────┘
                               │
@@ -130,7 +130,12 @@ unified memory.
                 │       - propagate via 3D adjacency      │
                 │       - face barycentric raster +4 px   │
                 │         conservative margin             │
-                │  2. EDT nearest-fill for residual gutter│
+                │  2. cv2.INPAINT_NS radius=3 (PT parity) │
+                │  3. EDT nearest-fill post-pass          │
+                │     (MLX-specific: pads UV gutters so   │
+                │      3D viewers doing bilinear sampling │
+                │      across island edges don't pull in  │
+                │      atlas background → no black lines) │
                 └─────────────┬──────────────────────────┘
                               │
                               ▼
@@ -216,6 +221,23 @@ mid_block (UNetMidBlock2DCrossAttn)                                    │
    ▼
 conv_norm_out + SiLU + conv_out → (B*n_pbr*n_views, h, w, 4) noise prediction
 ```
+
+## Porting principle: match PT config exactly
+
+During development we drifted from the PT reference config (introduced
+`fast_bake_texture(mode="face_wta")`, `uv_inpaint(method="edt")`,
+increased `max_num_view`, halved `render_size`/`texture_size`). Each
+deviation was added to "work around" an artifact — and each one
+silently masked a still-unfixed port bug upstream. Re-aligning the
+defaults with PT after the port bugs were resolved sharpened every
+view, eliminated UV seam cracks, and matched PT quality.
+
+**Rule**: the first working version must match the reference config
+exactly. Only deviate when there is a target-framework constraint
+documented in code (e.g. `texture_size=2048` because the MLX Metal
+rasterizer lacks tiling and times out on the command buffer at
+PT's 4096). Every other config-level "knob" is almost certainly
+a port bug waiting to be found.
 
 ## Critical invariants (learned the hard way)
 

@@ -75,7 +75,9 @@ pipe(
 )
 ```
 
-Output: `textured.glb` with 1024² PBR albedo + metallic-roughness textures baked onto the mesh UVs (~7 min for 6 views at 512px on an M2, ~425s denoising + bake + inpaint).
+Output: `textured.glb` with 2048² PBR albedo + metallic-roughness textures baked onto the mesh UVs (~9 min for 6 views at 512px on an M2 Pro).
+
+Defaults match the PyTorch reference config exactly, with one documented exception: `texture_size=2048` (PT uses 4096). The MLX Metal rasterizer has no tiling and would exceed the GPU command-buffer budget at 4096² on laptop GPUs (`kIOGPUCommandBufferCallbackErrorImpactingInteractivity`). Every other knob — `max_num_view`, `render_size`, `num_inference_steps`, `guidance_scale`, bake mode, inpaint method — is PT-identical.
 
 ### Memory Requirements
 
@@ -92,15 +94,16 @@ Stage 2 (paint) adds ~6 GB peak for the UNet + VAE + DINOv2 at fp32.
 - ✅ **Stage 1** (shape generation): fully ported to MLX, validated numerically against PyTorch (1e-5)
 - ✅ **Stage 2** (PBR texture synthesis): fully ported to MLX, full UNet match within 1.17e-5 vs PyTorch
   - Metal rasterizer, UNet 2.5D with dual-stream reference attention, VAE, DINOv2, v_prediction scheduler
-  - **Per-face WTA bake merge** (winner-takes-all per UV face) eliminates the rainbow speckles that cosine-weighted averaging produces from slightly-divergent multi-view diffusion outputs
-  - **Mesh-aware vertex-color propagation + face barycentric raster** fills UV islands; gutter completed by EDT nearest-fill (no cv2.inpaint cross-island bleed)
+  - **Cosine-weighted bake blend** (PT-parity `fast_bake_texture`) smooths across face seams
+  - **Mesh-aware vertex-color propagation + face barycentric raster**, `cv2.INPAINT_NS` (PT-parity), plus an EDT nearest-fill post-pass that pads UV gutters so 3D viewers doing bilinear sampling across island boundaries never pull in the atlas background
   - **RealESRGAN x4 super-resolution** in MLX (512² → 2048² per view before bake)
+  - **GLB export**: PBRMaterial with sRGB `baseColorTexture`, `metallicRoughnessTexture` (glTF channel order), `doubleSided=true`
+  - All pipeline defaults now match the PyTorch reference exactly (see porting principle in `docs/forward_pass.md`)
 
 ### Texture quality notes
 
 - Reference image must match the mesh content (e.g. mermaid image on mermaid mesh). Cross-pairing produces fragmented atlases since the diffusion's albedo views can't coherently project onto an unrelated 3D layout.
-- Front views of meshes with highly-fragmented UV layouts on detailed regions (e.g. faces) may show transitions where adjacent UV islands' best views differ. Meshes with simpler UV layouts (case_1 fox) render cleanly across all 6 azimuths.
-- Tested on `assets/case_1/mesh.glb` (fox, all 6 views clean) and `assets/case_2/mesh.glb` (mermaid, 4/6 views clean).
+- Tested on `assets/case_1/mesh.glb` (fox) and `assets/case_2/mesh.glb` (mermaid) — all 6/6 views clean with PT-aligned defaults.
 
 ---
 

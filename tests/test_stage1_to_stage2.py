@@ -19,7 +19,10 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "hy3dshape"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "hy3dpaint"))
 
-DEFAULT_IMAGE = "/tmp/full/ComfyUI_temp_cpzbr_00007_.png"
+DEFAULT_IMAGE = os.path.join(
+    os.path.dirname(__file__), "..", "hy3dpaint", "assets", "case_2",
+    "image.png",
+)
 DEFAULT_OUT = "/tmp/full/stage1_to_stage2"
 
 
@@ -64,10 +67,11 @@ def main() -> None:
         Hunyuan3DPaintPipelineMLX,
     )
 
+    # PT reference defaults (see hy3dpaint/tests/test_e2e_mesh.py).
+    # texture_size=2048 (not PT's 4096) to fit the Metal command-buffer
+    # budget — the MLX rasterizer has no tiling.
     cfg = Hunyuan3DPaintConfigMLX(max_num_view=6, resolution=512)
-    cfg.render_size = 1024
     cfg.texture_size = 2048
-    cfg.mlx_num_inference_steps = 15
 
     t0 = time.time()
     paint_pipe = Hunyuan3DPaintPipelineMLX(cfg)

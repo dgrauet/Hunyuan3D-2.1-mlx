@@ -183,6 +183,13 @@ class ShapePipeline:
             mc_level=mc_level,
         )
 
+        # Flip face winding to match PT reference's export_to_trimesh.
+        # skimage.measure.marching_cubes produces inward-facing normals for
+        # SDF > 0 inside convention; PT's hy3dshape/pipelines.py inverts the
+        # winding (mesh_f[:, ::-1]) so that Stage 2's bake (which rejects
+        # back-facing texels via a cosine-angle test) sees outward normals.
+        mesh.faces = mesh.faces[:, ::-1]
+
         return mesh
 
     @classmethod

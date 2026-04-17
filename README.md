@@ -79,6 +79,10 @@ Output: `textured.glb` with 2048² PBR albedo + metallic-roughness textures bake
 
 Defaults match the PyTorch reference config exactly, with one documented exception: `texture_size=2048` (PT uses 4096). The MLX Metal rasterizer has no tiling and would exceed the GPU command-buffer budget at 4096² on laptop GPUs (`kIOGPUCommandBufferCallbackErrorImpactingInteractivity`). Every other knob — `max_num_view`, `render_size`, `num_inference_steps`, `guidance_scale`, bake mode, inpaint method — is PT-identical.
 
+### End-to-end (image → textured GLB)
+
+`tests/test_stage1_to_stage2.py` chains both stages on a single reference image. Stage 1's dense marching-cubes mesh is automatically remeshed to ~40k faces before Stage 2's bake (the Metal rasterizer can't handle Stage 1's raw ~500k faces at `texture_size=2048`).
+
 ### Memory Requirements
 
 | Precision | DiT Size | Peak Memory | Recommended Mac |

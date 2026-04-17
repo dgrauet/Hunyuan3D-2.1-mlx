@@ -34,31 +34,34 @@ def main() -> None:
     shape_glb = os.path.join(out_dir, "shape.glb")
     textured_obj = os.path.join(out_dir, "textured.obj")
 
-    # --- Stage 1: image -> mesh ---
-    print(f"[Stage 1] Shape generation from {image_path}")
-    from hy3dshape.pipeline_mlx import ShapePipeline
+    # --- Stage 1: image -> mesh (skip if already cached) ---
+    if os.path.exists(shape_glb):
+        print(f"[Stage 1] Skipping — cached {shape_glb}")
+    else:
+        print(f"[Stage 1] Shape generation from {image_path}")
+        from hy3dshape.pipeline_mlx import ShapePipeline
 
-    t0 = time.time()
-    shape_pipe = ShapePipeline.from_pretrained("dgrauet/hunyuan3d-2.1-mlx")
-    print(f"  pipeline ready in {time.time() - t0:.1f}s")
+        t0 = time.time()
+        shape_pipe = ShapePipeline.from_pretrained("dgrauet/hunyuan3d-2.1-mlx")
+        print(f"  pipeline ready in {time.time() - t0:.1f}s")
 
-    t0 = time.time()
-    mesh = shape_pipe(
-        image_path,
-        num_inference_steps=50,
-        guidance_scale=7.5,
-        octree_resolution=256,
-        seed=42,
-    )
-    print(f"  shape generated in {time.time() - t0:.1f}s "
-          f"({len(mesh.vertices)} verts, {len(mesh.faces)} faces)")
-    mesh.export(shape_glb)
-    print(f"  saved: {shape_glb}")
+        t0 = time.time()
+        mesh = shape_pipe(
+            image_path,
+            num_inference_steps=50,
+            guidance_scale=7.5,
+            octree_resolution=256,
+            seed=42,
+        )
+        print(f"  shape generated in {time.time() - t0:.1f}s "
+              f"({len(mesh.vertices)} verts, {len(mesh.faces)} faces)")
+        mesh.export(shape_glb)
+        print(f"  saved: {shape_glb}")
 
-    # Free the DiT before loading Stage 2 (both are memory-heavy)
-    del shape_pipe
-    import gc
-    gc.collect()
+        # Free the DiT before loading Stage 2 (both are memory-heavy)
+        del shape_pipe
+        import gc
+        gc.collect()
 
     # --- Stage 2: mesh + image -> textured GLB ---
     print(f"\n[Stage 2] PBR texture synthesis")
@@ -78,11 +81,16 @@ def main() -> None:
     print(f"  pipeline ready in {time.time() - t0:.1f}s")
 
     t0 = time.time()
+    # Stage 1 produces a dense mesh (~500k faces). Without remeshing,
+    # the Metal rasterizer blows past the command-buffer budget at
+    # texture_size=2048 (Impacting Interactivity). pymeshlab's
+    # quadric-decimation remesh brings it down to ~40-60k faces —
+    # still high-quality, fits in budget.
     paint_pipe(
         mesh_path=shape_glb,
         image_path=image_path,
         output_mesh_path=textured_obj,
-        use_remesh=False,
+        use_remesh=True,
         save_glb=True,
     )
     print(f"  texture synthesized in {time.time() - t0:.1f}s")

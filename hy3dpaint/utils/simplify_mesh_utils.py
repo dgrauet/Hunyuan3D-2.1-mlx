@@ -33,5 +33,9 @@ def mesh_simplify_trimesh(inputpath, outputpath, target_count=40000):
     face_num = courent.faces.shape[0]
 
     if face_num > target_count:
-        courent = courent.simplify_quadric_decimation(target_count)
+        # trimesh's simplify_quadric_decimation changed its signature:
+        # older versions took an integer face target as the first positional
+        # arg, newer ones expect `face_count=...` (first positional is
+        # `percent`, 0-1). Pass explicitly so either API works.
+        courent = courent.simplify_quadric_decimation(face_count=target_count)
     courent.export(outputpath)

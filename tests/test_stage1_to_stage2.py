@@ -70,11 +70,9 @@ def main() -> None:
         Hunyuan3DPaintPipelineMLX,
     )
 
-    # PT reference defaults (see hy3dpaint/tests/test_e2e_mesh.py).
-    # texture_size=2048 (not PT's 4096) to fit the Metal command-buffer
-    # budget — the MLX rasterizer has no tiling.
+    # PT reference defaults. texture_size=4096 works now that
+    # extract_textiles tiles its 4096² UV raster across 16 sub-dispatches.
     cfg = Hunyuan3DPaintConfigMLX(max_num_view=6, resolution=512)
-    cfg.texture_size = 2048
 
     t0 = time.time()
     paint_pipe = Hunyuan3DPaintPipelineMLX(cfg)

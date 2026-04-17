@@ -264,6 +264,64 @@ class MeshRenderMLX:
         )
         return mx.expand_dims(rast_out, axis=0)
 
+    def _rasterize_tiled(self, pos_clip, resolution, tiles=4):
+        """Tile rasterization across clip-space quadrants.
+
+        At 4096² the single-dispatch raster exceeds Metal's command-buffer
+        budget. Split clip space into ``tiles`` × ``tiles`` regions; for
+        each region, scale vertex clip coords so the region maps to
+        [-1, 1]² and rasterize at (H/tiles, W/tiles). Concatenate.
+
+        Assumes ``tiles`` divides H and W evenly. Preserves the row-to-
+        clip-y convention of the underlying rasterizer (verified by
+        comparing tiled output to single-dispatch output at 2048²).
+        """
+        H, W = int(resolution[0]), int(resolution[1])
+        if H % tiles != 0 or W % tiles != 0:
+            return self._rasterize(pos_clip, resolution)
+        tH, tW = H // tiles, W // tiles
+
+        verts = pos_clip[0] if pos_clip.ndim == 3 else pos_clip
+        vx, vy, vz, vw = verts[:, 0], verts[:, 1], verts[:, 2], verts[:, 3]
+
+        rows_fi, rows_bary = [], []
+        for i in range(tiles):
+            cols_fi, cols_bary = [], []
+            # Tile i covers rows [i*tH, (i+1)*tH). Row 0 = first tile output.
+            # Matches the full-raster convention (tiled(0,0) == full[0:tH, 0:tW]).
+            y_lo = -1.0 + 2.0 * i / tiles
+            y_hi = -1.0 + 2.0 * (i + 1) / tiles
+            mid_y = 0.5 * (y_lo + y_hi)
+            span_y = 0.5 * (y_hi - y_lo)
+            for j in range(tiles):
+                x_lo = -1.0 + 2.0 * j / tiles
+                x_hi = -1.0 + 2.0 * (j + 1) / tiles
+                mid_x = 0.5 * (x_lo + x_hi)
+                span_x = 0.5 * (x_hi - x_lo)
+                # Homogeneous-safe clip transform: NDC' = (NDC - mid)/span
+                # ⇒ clip' = (clip - w*mid)/span (w unchanged).
+                new_verts = mx.stack([
+                    (vx - vw * mid_x) / span_x,
+                    (vy - vw * mid_y) / span_y,
+                    vz,
+                    vw,
+                ], axis=-1)
+                fi, bary = self.raster.rasterize(
+                    new_verts, self.pos_idx, (tH, tW),
+                )
+                mx.synchronize()
+                cols_fi.append(fi)
+                cols_bary.append(bary)
+            rows_fi.append(mx.concatenate(cols_fi, axis=1))
+            rows_bary.append(mx.concatenate(cols_bary, axis=1))
+        findices = mx.concatenate(rows_fi, axis=0)
+        bary = mx.concatenate(rows_bary, axis=0)
+        rast_out = mx.concatenate(
+            [bary, mx.expand_dims(findices.astype(mx.float32), axis=-1)],
+            axis=-1,
+        )
+        return mx.expand_dims(rast_out, axis=0)
+
     def _compute_face_normals(self, triangles):
         """Face normals from (F, 3, 3) triangle vertices."""
         e1 = triangles[:, 1, :] - triangles[:, 0, :]
@@ -585,8 +643,19 @@ class MeshRenderMLX:
         ], axis=1) * 2.0 - 1.0
         vtx_uv_clip = mx.expand_dims(vtx_uv_clip, 0)  # (1, V, 4)
 
-        # Rasterize in UV space
-        rast_out = self._rasterize(vtx_uv_clip, self.texture_size)
+        # Rasterize in UV space. At ≥4096² the single-dispatch raster
+        # exceeds Metal's command-buffer budget, so tile it.
+        th, tw = self.texture_size
+        max_dim = max(th, tw)
+        tiles = 1
+        if max_dim >= 4096:
+            tiles = 4
+        elif max_dim >= 3072:
+            tiles = 2
+        if tiles > 1:
+            rast_out = self._rasterize_tiled(vtx_uv_clip, self.texture_size, tiles=tiles)
+        else:
+            rast_out = self._rasterize(vtx_uv_clip, self.texture_size)
         fi = rast_out[0, ..., -1].astype(mx.int32)
         bary = rast_out[0, ..., :-1]
 

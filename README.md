@@ -46,7 +46,7 @@ Override the default HF lookup by setting `HUNYUAN3D_MLX_WEIGHTS_DIR=/path/to/lo
 ### Install
 
 ```bash
-pip install mlx mlx-ops safetensors Pillow trimesh scikit-image PyMCubes scipy
+pip install mlx mlx-arsenal safetensors Pillow trimesh scikit-image PyMCubes scipy
 pip install huggingface_hub xatlas opencv-python  # for Stage 2
 ```
 

@@ -1,14 +1,14 @@
 """MLX mesh renderer for Hunyuan3D texture pipeline.
 
 Port of MeshRender's rendering and texture baking pipeline to MLX,
-using mlx_ops.rasterize as the Metal rasterization backend.
+using mlx_arsenal.rasterize as the Metal rasterization backend.
 """
 
 import mlx.core as mx
 import numpy as np
 
-from mlx_ops.rasterize import interpolate as mlx_interpolate
-from mlx_ops.rasterize import rasterize_triangles
+from mlx_arsenal.rasterize import interpolate as mlx_interpolate
+from mlx_arsenal.rasterize import rasterize_triangles
 
 from .camera_utils_mlx import (
     get_mv_matrix,
@@ -24,7 +24,7 @@ from .camera_utils_mlx import (
 
 
 class MLXRasterizer:
-    """Adapter wrapping mlx_ops.rasterize to match MeshRender's interface."""
+    """Adapter wrapping mlx_arsenal.rasterize to match MeshRender's interface."""
 
     @staticmethod
     def rasterize(pos, tri, resolution, clamp_depth=None, use_depth_prior=0):

@@ -10,7 +10,7 @@ from typing import Optional, Callable
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx_ops.encoding import FourierEmbedder
+from mlx_arsenal.encoding import FourierEmbedder
 
 
 # --------------------------------------------------------------------------- #

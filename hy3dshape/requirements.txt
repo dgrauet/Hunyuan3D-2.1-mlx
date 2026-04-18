@@ -41,6 +41,6 @@ onnxruntime
 
 # MLX port
 mlx>=0.31.0
-mlx-arsenal
+mlx-arsenal>=0.2.1
 safetensors
 Pillow

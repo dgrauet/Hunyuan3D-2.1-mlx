@@ -15,7 +15,8 @@ import mlx.nn as nn
 import numpy as np
 from PIL import Image
 
-from .schedulers_mlx import FlowMatchEulerDiscreteScheduler
+from mlx_arsenal.diffusion import FlowMatchEulerDiscreteScheduler
+
 from .models.conditioner_mlx import ImageEncoder
 from .models.denoisers.hunyuandit_mlx import HunYuanDiTPlain
 from .models.autoencoders.model_mlx import ShapeVAEDecoder

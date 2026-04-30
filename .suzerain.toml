@@ -4,3 +4,4 @@ stack = "auto"
 mode = "advisory"
 
 [exemptions]
+LO001 = "Fork upstream avec layout flat, refactor reporté"

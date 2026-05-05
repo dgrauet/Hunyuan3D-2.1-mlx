@@ -1,7 +1,7 @@
-[suzerain]
+[intendant]
 version = "1"
 stack = "auto"
-mode = "advisory"
+enforcement = "advisory"
 
 [exemptions]
 PYTHON_LO001 = "Fork upstream avec layout flat, refactor reporté"

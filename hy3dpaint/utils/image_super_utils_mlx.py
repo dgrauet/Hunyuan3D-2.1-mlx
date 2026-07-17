@@ -238,5 +238,7 @@ class imageSuperNetMLX:
 
         # Convert back to PIL Image
         output_np = np.array(output[0])  # Remove batch dim
-        output_np = np.clip(output_np * 255.0, 0, 255).astype(np.uint8)
+        # Round like RealESRGANer.enhance ((output * 255.0).round()); a
+        # plain astype would truncate and shift ~half the pixels by 1/255.
+        output_np = np.clip(output_np * 255.0, 0, 255).round().astype(np.uint8)
         return Image.fromarray(output_np)

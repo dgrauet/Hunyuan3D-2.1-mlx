@@ -4,4 +4,6 @@ stack = "auto"
 enforcement = "advisory"
 
 [exemptions]
-PYTHON_LO001 = "Fork upstream avec layout flat, refactor reporté"
+PYTHON_LO001 = "Upstream fork with flat layout, refactor deferred"
+RL003 = "Iso-upstream fork with no versioning of its own — release-please does not apply"
+SA005 = "Automated dependency bumps would conflict with iso-upstream requirements.txt"

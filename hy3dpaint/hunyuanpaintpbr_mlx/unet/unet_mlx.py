@@ -179,6 +179,11 @@ class UNet2DConditionModelMLX(nn.Module):
         if timestep.ndim == 0:
             timestep = mx.expand_dims(timestep, 0)
         t_emb = get_timestep_embedding(timestep, self.time_proj_dim)
+        # Cast the fp32 sinusoidal embedding to the sample dtype before the
+        # MLP, matching diffusers UNet2DConditionModel
+        # (`t_emb = t_emb.to(dtype=sample.dtype)`); otherwise the fp32 temb
+        # would upcast every ResNet block through the additive path.
+        t_emb = t_emb.astype(sample.dtype)
         emb = self.time_embedding(t_emb)  # (B, time_embed_dim)
 
         # Broadcast for batch

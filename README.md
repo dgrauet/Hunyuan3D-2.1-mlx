@@ -91,7 +91,7 @@ Defaults match the PyTorch reference config exactly, including `texture_size=409
 | INT8      | 3.0 GB   | ~6 GB       | 16 GB+          |
 | INT4      | 1.6 GB   | ~4 GB       | 16 GB           |
 
-Stage 2 (paint) adds ~6 GB peak for the UNet + VAE + DINOv2 at fp32.
+Stage 2 (paint) adds a few GB peak for the UNet + VAE + DINOv2, all running in fp16 like the PyTorch reference.
 
 ### Scope
 

@@ -212,6 +212,9 @@ class imageSuperNetMLX:
             raise ValueError(f"Unsupported weight format: {weights_path}")
 
         self.model.load_weights(list(weights.items()))
+        # PT reference runs RealESRGAN with half=True
+        # (utils/image_super_utils.py:33) — mirror in fp16.
+        self.model.set_dtype(mx.float16)
         mx.eval(self.model.parameters())
 
     def __call__(self, image: Image.Image) -> Image.Image:
@@ -223,10 +226,11 @@ class imageSuperNetMLX:
         Returns:
             Super-resolved PIL Image (RGB).
         """
-        # Convert PIL Image to NHWC float32 array normalized to [0, 1]
+        # Convert PIL Image to NHWC array normalized to [0, 1], fp16 like
+        # the PT reference (half=True)
         img_np = np.array(image).astype(np.float32) / 255.0
         # Add batch dimension: (H, W, C) -> (1, H, W, C)
-        img_mx = mx.array(img_np[np.newaxis, ...])
+        img_mx = mx.array(img_np[np.newaxis, ...]).astype(mx.float16)
 
         # Run inference
         output = self.model(img_mx)

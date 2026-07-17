@@ -105,8 +105,14 @@ class RotaryEmbedding:
         out_even = x_even * cos_half - x_odd * sin_half
         out_odd = x_odd * cos_half + x_even * sin_half
 
-        # Interleave back: stack on last dim then flatten
-        return mx.stack([out_even, out_odd], axis=-1).reshape(x.shape)
+        # Interleave back: stack on last dim then flatten. The fp32 cos/sin
+        # promote the products to fp32; cast back to the input dtype like
+        # PT's apply_rotary_emb (`(x.float() * cos + ...).to(x.dtype)`).
+        return (
+            mx.stack([out_even, out_odd], axis=-1)
+            .reshape(x.shape)
+            .astype(x.dtype)
+        )
 
 
 # ---------------------------------------------------------------------------

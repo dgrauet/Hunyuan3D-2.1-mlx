@@ -285,15 +285,12 @@ class HunyuanPaintModelMLX:
         del vae_w
 
         # --- DINOv2 ---
-        # Weights ship as fp16. With 40 transformer blocks the per-op
-        # quantisation error accumulates (output diverges ~5x vs fp32 HF on
-        # the same input — measured). Upcast to fp32 for DINO: the model is
-        # small enough (~1.2 GB weights) that the extra memory is fine, and
-        # the reference conditioning quality depends on clean features.
+        # Run in fp16 like the PT reference (utils/multiview_utils.py:57
+        # casts Dino_v2 to torch.float16). MLX fp16 gemm/norm kernels
+        # accumulate in fp32, matching CUDA fp16 semantics.
         print("Loading DINOv2...")
         dino = DINOv2MLX()
-        dino_w = {k: v.astype(mx.float32) for k, v in
-                  mx.load(str(weights_dir / "paint_dino.safetensors")).items()}
+        dino_w = dict(mx.load(str(weights_dir / "paint_dino.safetensors")))
         dino.load_weights(list(dino_w.items()))
         del dino_w
 
@@ -385,6 +382,16 @@ class HunyuanPaintModelMLX:
         del unet_w, stripped, stripped_dual
 
         scheduler = UniPCMultistepSchedulerMLX()
+
+        # PT reference loads the whole paint pipeline with
+        # torch_dtype=torch.float16 (utils/multiview_utils.py:46); mirror
+        # it so any fp32 straggler in the checkpoints is downcast and the
+        # forward runs in fp16 end-to-end.
+        for module in (unet, vae, dino, image_proj):
+            module.set_dtype(mx.float16)
+        if unet_dual is not None:
+            unet_dual.set_dtype(mx.float16)
+        learned = {k: v.astype(mx.float16) for k, v in learned.items()}
 
         model = HunyuanPaintModelMLX(
             unet=unet,

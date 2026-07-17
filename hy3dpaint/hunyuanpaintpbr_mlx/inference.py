@@ -117,7 +117,8 @@ def generate_multiview_pbr(
             )
             arr = np.array(pil).astype(np.float32) / 255.0
             arrays.append(arr)
-        batch = mx.array(np.stack(arrays))  # (N, H, W, 3)
+        # fp16 like the PT reference (pipeline.py:245 sends inputs .half())
+        batch = mx.array(np.stack(arrays)).astype(mx.float16)  # (N, H, W, 3)
         # vae.encode already multiplies by self.scaling_factor internally;
         # do NOT re-multiply (was double-scaling latents to ~0.033 of the
         # expected magnitude, making ref_latents and z_normal/z_pos
@@ -157,7 +158,7 @@ def generate_multiview_pbr(
     # HF DINOv2 produces at 224 input — the distribution attn_dino's
     # to_k / to_v were trained against. HF DINO bridge OOMs 32 GB in
     # both fp32 and fp16.
-    dino_in = preprocess_for_dino(ref_u8)
+    dino_in = preprocess_for_dino(ref_u8).astype(mx.float16)
     dino_feat = model.dino(dino_in)  # (1, 1370, 1536)
     # Separate CLS + patch grid, avg-pool 37x37 -> 16x16
     import math as _math
@@ -234,7 +235,8 @@ def generate_multiview_pbr(
     view_scales = [_cam_mapping(a) for a in camera_azims]
     # Repeat for materials: [albedo_scales, mr_scales]
     view_scale_flat = np.array(view_scales * n_pbr, dtype=np.float32)
-    view_scale = mx.array(view_scale_flat)[:, None, None, None]  # (12, 1, 1, 1)
+    # fp16 so the CFG combine below stays in the model dtype
+    view_scale = mx.array(view_scale_flat)[:, None, None, None].astype(mx.float16)  # (12, 1, 1, 1)
 
     # ------------------------------------------------------------------
     # 5. Prepare condition latents for concat
@@ -246,7 +248,9 @@ def generate_multiview_pbr(
     # ------------------------------------------------------------------
     # 6. Denoising loop
     # ------------------------------------------------------------------
-    latents = mx.random.normal((n_pbr * n_views, latent_size, latent_size, 4))
+    latents = mx.random.normal(
+        (n_pbr * n_views, latent_size, latent_size, 4), dtype=mx.float16
+    )
     model.scheduler.set_timesteps(num_inference_steps)
 
     print(f"  Denoising ({num_inference_steps} steps, {n_views} views, CFG={guidance_scale})...")

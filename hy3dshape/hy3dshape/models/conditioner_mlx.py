@@ -350,8 +350,10 @@ class ImageEncoder(nn.Module):
         Returns:
             Normalized image tensor.
         """
-        mean = mx.array(self.MEAN).reshape(1, 1, 1, 3)
-        std = mx.array(self.STD).reshape(1, 1, 1, 3)
+        # Cast stats to the image dtype (torchvision Normalize keeps the
+        # input dtype, so a half input stays half in the PT reference).
+        mean = mx.array(self.MEAN).reshape(1, 1, 1, 3).astype(image.dtype)
+        std = mx.array(self.STD).reshape(1, 1, 1, 3).astype(image.dtype)
         return (image - mean) / std
 
     def __call__(self, image: mx.array, value_range=(-1, 1)) -> mx.array:
@@ -387,7 +389,10 @@ class ImageEncoder(nn.Module):
         Returns:
             Zero tensor of shape (batch_size, num_patches, hidden_size).
         """
-        return mx.zeros((batch_size, self.num_patches, self.hidden_size))
+        return mx.zeros(
+            (batch_size, self.num_patches, self.hidden_size),
+            dtype=self.layernorm.weight.dtype,
+        )
 
     @classmethod
     def from_pretrained(cls, weights_path: str, config: dict) -> "ImageEncoder":

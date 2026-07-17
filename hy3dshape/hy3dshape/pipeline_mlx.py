@@ -47,11 +47,19 @@ class ShapePipeline:
         dit: HunYuanDiTPlain,
         vae: ShapeVAEDecoder,
         scheduler: FlowMatchEulerDiscreteScheduler,
+        dtype: mx.Dtype = mx.float16,
     ):
         self.image_encoder = image_encoder
         self.dit = dit
         self.vae = vae
         self.scheduler = scheduler
+        # PT reference runs the whole pipeline in fp16 (pipelines.py
+        # dtype=torch.float16 + self.to(device, dtype)); mirror it by
+        # casting every floating-point weight and driving activations
+        # in the same dtype.
+        self.dtype = dtype
+        for module in (self.image_encoder, self.dit, self.vae):
+            module.set_dtype(dtype)
 
     def preprocess_image(self, image: Union[str, Image.Image, mx.array]) -> mx.array:
         """Load and preprocess an image for DINOv2.
@@ -82,9 +90,10 @@ class ShapePipeline:
             target_size = self.image_encoder.image_size
             image = image.resize((target_size, target_size), Image.BILINEAR)
 
-            # Convert to numpy then mx array: (H, W, 3) float32 in [-1, 1]
+            # Convert to numpy then mx array: (H, W, 3) in [-1, 1],
+            # cast to the pipeline dtype (PT: image.to(device, self.dtype))
             arr = np.array(image, dtype=np.float32) / 127.5 - 1.0
-            return mx.array(arr[None])  # (1, H, W, 3)
+            return mx.array(arr[None]).astype(self.dtype)  # (1, H, W, 3)
 
         # Already mx.array
         return image
@@ -130,7 +139,9 @@ class ShapePipeline:
 
         # 3. Prepare latents
         num_latents, latent_dim = self.vae.latent_shape
-        latents = mx.random.normal((1, num_latents, latent_dim))
+        latents = mx.random.normal(
+            (1, num_latents, latent_dim), dtype=self.dtype
+        )
         _materialize(latents)
 
         # 4. Set up scheduler with sigmas from 0 to 1 (matching original pipeline)
@@ -166,8 +177,10 @@ class ShapePipeline:
                 pred_cond, pred_uncond = noise_pred[:1], noise_pred[1:]
                 noise_pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
 
-            # Euler step
-            latents = self.scheduler.step(noise_pred, t, latents)
+            # Euler step. The scheduler's fp32 sigmas promote the update to
+            # fp32; cast back like diffusers FlowMatchEulerDiscreteScheduler
+            # (upcast for precision, return prev_sample in model dtype).
+            latents = self.scheduler.step(noise_pred, t, latents).astype(self.dtype)
             _materialize(latents)
 
         # 6. Free DiT to save memory
@@ -197,6 +210,7 @@ class ShapePipeline:
     def from_pretrained(
         cls,
         weights_source: str = "dgrauet/hunyuan3d-2.1-mlx",
+        dtype: mx.Dtype = mx.float16,
     ) -> "ShapePipeline":
         """Load all components from converted weights.
 
@@ -277,4 +291,5 @@ class ShapePipeline:
             dit=dit,
             vae=vae,
             scheduler=scheduler,
+            dtype=dtype,
         )

@@ -8,6 +8,7 @@ This fork must stay trivially mergeable with upstream:
 
 - **Never modify upstream PyTorch files.** All MLX code lives in additive `*_mlx.py` files (or `*_mlx/` packages) next to the upstream file they mirror, with the same module/class/method structure so a side-by-side diff shows only PyTorch↔MLX op substitutions.
 - Config defaults must match the PyTorch reference exactly. Any deviation hides a port bug — match first, optimize only for a documented framework constraint (e.g. Metal command-buffer budget, handled via tiling).
+- **Iso-upstream includes the runtime execution config, not just code structure**: dtype policy (upstream runs both stages in fp16 end-to-end), device semantics, scheduler precision islands. MLX type promotion is stricter than PyTorch's (0-d arrays are not weak like torch scalar tensors), so a single fp32 constant silently upcasts everything downstream — verify actual kernel dtypes with `smeltr record` + op summary after any pipeline change, don't trust the code diff.
 - Keep `git fetch upstream` clean: the only tolerated upstream edits are the README MLX section and appended MLX deps in `hy3dshape/requirements.txt`.
 
 ## Workflow

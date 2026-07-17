@@ -180,7 +180,9 @@ class DINOv2MLX(nn.Module):
             align_corners=False,
         )
         patch_new = pt_new.permute(0, 2, 3, 1).numpy().reshape(1, g_new * g_new, -1)
-        new_pos = mx.array(np.concatenate([cls_np, patch_new], axis=1))
+        new_pos = mx.array(
+            np.concatenate([cls_np, patch_new], axis=1)
+        ).astype(self.pos_embed.dtype)
         cache[num_patches_in] = new_pos
         self._pos_embed_cache = cache
         return new_pos

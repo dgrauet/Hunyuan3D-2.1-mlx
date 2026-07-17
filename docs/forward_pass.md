@@ -234,10 +234,22 @@ view, eliminated UV seam cracks, and matched PT quality.
 
 **Rule**: the first working version must match the reference config
 exactly. Only deviate when there is a target-framework constraint
-documented in code (e.g. `texture_size=2048` because the MLX Metal
-rasterizer lacks tiling and times out on the command buffer at
-PT's 4096). Every other config-level "knob" is almost certainly
-a port bug waiting to be found.
+documented in code (e.g. the UV-space rasterizer processes the atlas in
+tiles so PT's `texture_size=4096` fits the Metal command-buffer budget).
+Every other config-level "knob" is almost certainly a port bug waiting
+to be found.
+
+### Documented deviations from upstream behavior
+
+- **RealESRGAN channel order**: upstream feeds RGB (`np.array(PIL)`)
+  into `RealESRGANer.enhance()`, which assumes cv2-BGR input and does
+  `cvtColor(BGR2RGB)` before the net and the inverse swap after — so
+  the reference super-resolves each view with R and B swapped, then
+  restores the order. This is an upstream bug (the net is trained on
+  RGB). The MLX port feeds the net proper RGB and does NOT emulate the
+  double swap; visible impact is minimal because the net is nearly
+  color-symmetric, but pixel-exact parity against PT's SR output is
+  not expected. Decision 2026-07-17.
 
 ## Critical invariants (learned the hard way)
 

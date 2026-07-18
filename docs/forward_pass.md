@@ -247,9 +247,19 @@ to be found.
   the reference super-resolves each view with R and B swapped, then
   restores the order. This is an upstream bug (the net is trained on
   RGB). The MLX port feeds the net proper RGB and does NOT emulate the
-  double swap; visible impact is minimal because the net is nearly
-  color-symmetric, but pixel-exact parity against PT's SR output is
-  not expected. Decision 2026-07-17.
+  double swap. Decision 2026-07-17.
+
+  Measured on the case_2 reference (512→2048, real weights, MLX net
+  run both ways): mean |diff| 1.3/255, p99 = 20, local max 152/255,
+  23% of pixels off by >2, spread evenly across channels (R 1.55 /
+  G 1.09 / B 1.36). The two outputs are perceptually indistinguishable
+  — tones and sharpness match — but the divergence concentrates on
+  high-frequency detail (edges, specular highlights), where the net
+  reconstructs slightly different micro-detail depending on channel
+  order. So the impact is perceptually negligible yet far larger than
+  rounding noise locally: pixel-exact parity against PT's SR output is
+  impossible by construction, and SR comparisons must be perceptual,
+  not max_abs.
 
 ## Critical invariants (learned the hard way)
 

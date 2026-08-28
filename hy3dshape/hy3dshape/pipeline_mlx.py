@@ -147,6 +147,32 @@ class ShapePipeline:
         # 4. Set up scheduler with sigmas from 0 to 1 (matching original pipeline)
         sigmas = np.linspace(0, 1, num_inference_steps)
         self.scheduler.set_timesteps(num_inference_steps, sigmas=sigmas)
+        # `mlx_arsenal.diffusion.FlowMatchEulerDiscreteScheduler.set_timesteps`
+        # is documented (its own docstring) for a DESCENDING default schedule
+        # (sigmas=None) and appends a trailing 0.0 to complete that descent to
+        # "clean". This pipeline never uses that default -- it always hands the
+        # scheduler an ASCENDING explicit schedule (the `sigmas` line above),
+        # which is outside the convention that trailing 0.0 was written for.
+        # The reference PyTorch pipeline's own scheduler
+        # (hy3dshape/schedulers.py::FlowMatchEulerDiscreteScheduler.
+        # set_timesteps), given the SAME explicit ascending sigmas, appends a
+        # trailing 1.0 instead (`torch.cat([sigmas, torch.ones(1)])`), so its
+        # final Euler step is a deliberate no-op (`sigma_next - sigma == 0`).
+        # Left uncorrected, the MLX port's trailing 0.0 makes the LAST step of
+        # every render subtract the full model-predicted velocity from the
+        # sample (`sigma_next - sigma == -1.0`) instead of doing nothing --
+        # reversing most of the accumulated denoising trajectory in one step,
+        # which produced an empty SDF volume (no near-surface voxels anywhere)
+        # on every render tested, independent of image, step count or octree
+        # resolution. `mlx_arsenal` is behaving exactly as its own docs
+        # describe; this pipeline is the caller feeding it a schedule shape
+        # its default was never written for, so the fix belongs here, not in
+        # that dependency. Corrected by overwriting the scheduler's own last
+        # sigma to match the reference's trailing-1.0 convention exactly.
+        self.scheduler.sigmas = mx.concatenate([
+            self.scheduler.sigmas[:-1],
+            mx.ones(1, dtype=self.scheduler.sigmas.dtype),
+        ])
 
         do_cfg = guidance_scale >= 0
 

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+# Packaging metadata only — added downstream (fused-render), not upstream.
+# Before this file, `hy3dshape/hy3dshape` was a plain folder with no build
+# system, so `uv` had nothing to resolve it against as a git dependency; this
+# is the minimal manifest that makes `pip install`/`uv sync` able to build and
+# install it as an importable package named `hy3dshape`.
+#
+# Deliberately `dependencies = []`. `hy3dshape/hy3dshape/__init__.py` imports
+# the PyTorch reference pipeline (`from .pipelines import ...`, which itself
+# does a bare `import torch` and `from diffusers...`) — that chain runs for
+# ANY `import hy3dshape`, MLX-only submodules included, because Python always
+# executes a package's `__init__.py` before a submodule of it. Declaring
+# torch/diffusers/etc. here to make that succeed would drag the reference
+# implementation's entire stack (torch, diffusers, transformers, torchvision,
+# pymeshlab, rembg, onnxruntime, gradio...) into what is meant to be a lean,
+# MLX-only capability. The consuming runner (`fused_render/ai/runners/
+# hunyuan3d_mlx/worker.py`) never does a plain `import hy3dshape` — it
+# registers stand-in package modules for `hy3dshape`, `hy3dshape.models`,
+# `hy3dshape.models.autoencoders` and `hy3dshape.models.denoisers` directly in
+# `sys.modules` (with `__path__` pointing at this package's real directories)
+# so Python's import machinery locates `pipeline_mlx.py` and its three sibling
+# `_mlx.py` modules via the normal path-based finder WITHOUT ever executing
+# the real (torch-importing) `__init__.py` files — see that worker's own
+# docstring for the mechanics. Runtime deps for that MLX path (mlx,
+# mlx-arsenal, numpy, pillow, trimesh, scikit-image, scipy) belong in the
+# runner's `pyproject.toml`, not here.
+name = "hy3dshape"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+# The package root is a directory named the same as the distribution
+# (`hy3dshape/hy3dshape/`, sibling to this file) — not a `src/` layout, just
+# upstream's own existing folder name.
+packages = ["hy3dshape"]
